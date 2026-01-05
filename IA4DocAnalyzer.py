@@ -3,7 +3,12 @@ import re
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from pandas import DataFrame as _DataFrame
+import os
+import io
+import zipfile
+
 
 st.set_page_config(page_title='Analyse Fiches IA4Doc', layout='wide')
 
@@ -133,6 +138,16 @@ def norm_verdict(x: str) -> str:
     return "none"
 
 
+
+def extract_modification(ref):
+    if not isinstance(ref, str):
+        return ""
+    ref = ref.strip()
+    match = re.search(r"(m\d{2})$", ref, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+
 # =====================================================================
 # PARSE FICHE
 # =====================================================================
@@ -204,6 +219,18 @@ def parse_fiche(file):
             date_test = pd.to_datetime(val_date, errors="coerce")
     except Exception:
         pass
+
+    # Site (B9 → ligne 9, index 8, colonne 1)
+    site = None
+    try:
+        val_site = df.iloc[8, 1]  # B9
+        if not pd.isna(val_site):
+            site = str(val_site).strip()
+            if site == "LTA":
+                site = "STMA"
+    except Exception:
+        pass
+
 
     # Classe documentaire (D15 → ligne 15, index 14) = avant 18
     classe_documentaire = None
@@ -334,6 +361,7 @@ def parse_fiche(file):
             "type_test": type_test,
             "type_document": type_doc,
             "classe_documentaire": classe_documentaire,
+            "site": site,
             "label_fonctionnalite": label_fonctionnalite,
             "nb_pages_total": nb_pages_total,
             "commentaire_additionnel": commentaire_add,
@@ -378,10 +406,40 @@ def parse_fiche(file):
 st.title("Analyse automatique des fiches IA4Doc")
 
 uploaded_files = st.file_uploader(
-    "Fichiers Excel",
-    type=["xlsx"],
+    "Fichiers Excel ou ZIP",
+    type=["xlsx", "zip"],
     accept_multiple_files=True
 )
+
+def iter_excel_files(uploaded_files):
+    """
+    Génère des objets fichier Excel (avec un attribut .name)
+    à partir de ce que l'utilisateur a uploadé :
+    - .xlsx directs
+    - .zip contenant des .xlsx
+    """
+    for up in uploaded_files:
+        fname = up.name.lower()
+
+        # 1) Cas ZIP
+        if fname.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(up) as zf:
+                    for member in zf.namelist():
+                        if not member.lower().endswith(".xlsx"):
+                            continue
+                        data = zf.read(member)
+                        bio = io.BytesIO(data)
+                        # On donne un "name" pour que parse_fiche puisse l'utiliser
+                        bio.name = os.path.basename(member)
+                        yield bio
+            except Exception as e:
+                st.error(f"Erreur en lisant le zip {up.name} : {e}")
+
+        # 2) Cas Excel direct
+        elif fname.endswith(".xlsx"):
+            yield up
+
 
 if uploaded_files:
 
@@ -391,7 +449,8 @@ if uploaded_files:
     dfs = []
     seen_files = set()
 
-    for file in uploaded_files:
+    for file in iter_excel_files(uploaded_files):
+        # file.name existe (xlsx direct ou fichier du zip)
         if file.name in seen_files:
             st.error(f"Fiche déjà chargée : {file.name} (ignorée)")
             continue
@@ -403,6 +462,13 @@ if uploaded_files:
                 dfs.append(df)
         except Exception as e:
             st.error(f"{file.name} : {e}")
+
+    if not dfs:
+        st.error("Aucune fiche valide.")
+        st.stop()
+
+    data = pd.concat(dfs, ignore_index=True)
+    data["fs_id"] = data["fs_id"].astype(str).str.strip()
 
     if not dfs:
         st.error("Aucune fiche valide.")
@@ -585,6 +651,7 @@ if uploaded_files:
         "type_test",
         "type_document",
         "classe_documentaire",
+        "site",
         "fonctionnalite",
         "nb_pages_total",
         "test_label",
@@ -803,6 +870,48 @@ if uploaded_files:
         st.dataframe(classe_summary)
     else:
         st.info("Aucune classe documentaire trouvée dans les fiches.")
+
+    # ------------------------------------------------------
+    # Export suivi recettage (Excel)
+    # ------------------------------------------------------
+    st.write("## Export suivi recettage")
+
+    def verdict_to_score(v):
+        v_norm = norm_verdict(v)
+        if v_norm == "bon":
+            return 1.0
+        if v_norm == "partiel":
+            return 0.5
+        if v_norm == "mauvais":
+            return 0.0
+        return np.nan
+
+    recettage_df = data[
+        ["fs_id", "verdict_doc", "classe_documentaire", "site", "ref_coedm"]
+    ].copy()
+
+    # Score
+    recettage_df["score"] = recettage_df["verdict_doc"].apply(verdict_to_score)
+
+    #Modification
+    recettage_df["Modification"] = recettage_df["ref_coedm"].apply(extract_modification)
+
+    # Réordonner les colonnes
+    recettage_df = recettage_df[
+        ["fs_id", "verdict_doc", "score", "classe_documentaire", "site", "Modification"]
+    ]
+
+    from io import BytesIO
+    output_recettage = BytesIO()
+    with pd.ExcelWriter(output_recettage, engine="xlsxwriter") as writer:
+        recettage_df.to_excel(writer, sheet_name="Suivi_recettage", index=False)
+
+    st.download_button(
+        "Export suivi recettage (Excel)",
+        data=output_recettage.getvalue(),
+        file_name="suivi_recettage.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     # ------------------------------------------------------
     # Téléchargement des résultats
