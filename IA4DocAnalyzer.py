@@ -154,6 +154,8 @@ def extract_modification(ref):
 def parse_fiche(file):
     filename = file.name
 
+    if filename.startswith("~$"):
+        return pd.DataFrame()  # fichier temporaire Excel => on ignore
     # Ex: "fs60-IA-v00-TUF-FFP_PV_...-Fiche-v01-CM.xlsx" → fs_id = "fs60"
     fs_id = filename.split("-")[0]
 
@@ -1129,6 +1131,7 @@ if uploaded_files:
         file_name="IA4Doc_tableaux_complets.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 
 
