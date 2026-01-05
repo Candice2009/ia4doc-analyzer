@@ -3,7 +3,6 @@ import re
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from pandas import DataFrame as _DataFrame
 import os
 import io
@@ -1130,6 +1129,7 @@ if uploaded_files:
         file_name="IA4Doc_tableaux_complets.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 
 
