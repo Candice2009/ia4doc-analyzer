@@ -4,16 +4,54 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from pandas import DataFrame as _DataFrame
 import os
 import io
 import zipfile
+import unicodedata
 
 
 st.set_page_config(page_title='Analyse Fiches IA4Doc', layout='wide')
 
 # --- Version affichée pour éviter les confusions ---
 # ---------------------------------------------------------------------
+
+def _normalize_text(s: object) -> str:
+    """Normalise un texte (minuscule, sans accents, espaces simplifiés)."""
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    # Retire les accents
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def verdict_to_score(verdict: object) -> float:
+    """Mappe le verdict doc vers un score [0..1] : bon=1, partiel=0.5, mauvais=0."""
+    v = _normalize_text(verdict)
+    if not v:
+        return np.nan
+
+    # Cas négatifs explicites
+    if "pas bon" in v or "non bon" in v:
+        return 0.0
+
+    # Priorité au partiel
+    if "partiel" in v:
+        return 0.5
+
+    # Bon / OK
+    if re.search(r"\bbon\b", v) or v.startswith("bon") or v in {"ok", "valide", "validee", "valide.", "conforme"}:
+        return 1.0
+
+    # Mauvais / KO
+    if "mauvais" in v or re.search(r"\bko\b", v) or v.startswith("ko"):
+        return 0.0
+
+    return np.nan
 # Helpers
 # ---------------------------------------------------------------------
 def infer_fo_cols(df: pd.DataFrame) -> list[str]:
@@ -29,6 +67,21 @@ def infer_fo_cols(df: pd.DataFrame) -> list[str]:
         m = re.search(r"(\d+)$", x)
         return int(m.group(1)) if m else 0
     return sorted(cols, key=_k)
+
+
+def excel_sheet_name(title: str) -> str:
+    """Noms de feuilles Excel : identiques aux titres Streamlit, mais compatibles Excel.
+    - max 31 caractères
+    - suppression des caractères interdits : : \ / ? * [ ]
+    """
+    if not isinstance(title, str):
+        title = str(title)
+    # Caractères interdits Excel
+    title = re.sub(r"[:\\/\?\*\[\]]", "", title)
+    title = title.strip().strip("'")
+    if not title:
+        title = "Feuil1"
+    return title[:31]
 
 
 # =====================================================================
@@ -86,9 +139,11 @@ def build_tab2bis(data, ref_base):
     fs_testes = data["fs_id"].astype(str).str.strip().unique()
     tab2bis = ref_base[ref_base["N° fs"].isin(fs_testes)].copy()
 
-    # moyenne taux_justes par FS
+    # moyenne performance (verdict) par FS : bon=100%, partiel=50%, mauvais=0%
+    tmp = data.copy()
+    tmp["__score__"] = tmp["verdict_doc"].apply(verdict_to_score) * 100.0
     taux_fs = (
-        data.groupby("fs_id")["taux_justes"]
+        tmp.groupby("fs_id")["__score__"]
         .mean()
         .rename(lambda x: str(x).strip())
         .to_dict()
@@ -164,6 +219,23 @@ def extract_modification(ref):
     return match.group(1) if match else ""
 
 
+def extract_doc_id(ref: str) -> str:
+    """Extrait un identifiant de document depuis la référence (nom de fichier).
+    Heuristique : cherche d'abord un motif explicite (doc/document/coedm/ref + chiffres),
+    sinon prend la première séquence de >=4 chiffres, sinon retourne la référence entière.
+    """
+    if not isinstance(ref, str):
+        return ""
+    s = ref.strip()
+    m = re.search(r"(?:doc|document|coedm|ref)[-_ ]*(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{4,})", s)
+    if m:
+        return m.group(1)
+    return s
+
+
 
 # =====================================================================
 # PARSE FICHE
@@ -175,18 +247,24 @@ def parse_fiche(file):
     if filename.startswith("~$"):
         return pd.DataFrame()  # fichier temporaire Excel => on ignore
 
+    # Exemples de noms :
+    # - fs60-IA-v00-TUF-FFP_PV_...-Fiche-v01-CM.xlsx
+    # - fs1-IA-v00-NR-...-Fiche-v01-CM.xlsx (fs 1 à 3 chiffres)
+    filename_clean = str(filename).strip()
 
-    # Ex: "fs60-IA-v00-TUF-FFP_PV_...-Fiche-v01-CM.xlsx" → fs_id = "fs60"
-    fs_id = filename.split("-")[0]
-
-    pattern = r"^fs\d+-IA-v\d+-TUF-(.+)-Fiche-v\d+-[A-Za-z]+\.xlsx$"
-    m = re.match(pattern, filename)
+    pat = r"^(fs\d{1,3})-IA-v\d+-(TUF|NR)-(.+)-Fiche-v\d+-[A-Za-z]+\.xlsx$"
+    m = re.match(pat, filename_clean, flags=re.IGNORECASE)
     if not m:
         raise ValueError(
             "Nom de fichier invalide. Format attendu : "
-            "fsXX-IA-vXX-TUF-<ref>-Fiche-vXX-<initiales>.xlsx"
+            "fs<1-3 chiffres>-IA-vXX-(TUF|NR)-<ref>-Fiche-vXX-<initiales>.xlsx"
         )
-    ref_from_filename = m.group(1)
+
+    fs_id = m.group(1).lower()
+    fiche_type = m.group(2).upper()
+    ref_from_filename = m.group(3)
+    doc_id = extract_doc_id(ref_from_filename)
+
 
     df = pd.read_excel(file, sheet_name="Template Fiche de Test", header=None)
 
@@ -302,6 +380,8 @@ def parse_fiche(file):
     except Exception:
         pass
 
+    verdict_score = verdict_to_score(verdict_doc)
+
     # Nom testeur : lignes 6 et 7 (index 5 & 6)
     nom_testeur = None
     try:
@@ -378,6 +458,9 @@ def parse_fiche(file):
         rec = {
             "fs_id": fs_id,
             "ref_coedm": ref_coedm,
+            "doc_id": doc_id,
+            "fiche_type": fiche_type,
+            "fiche_name": filename,
             "date_test": date_test,
             "type_test": type_test,
             "type_document": type_doc,
@@ -387,6 +470,7 @@ def parse_fiche(file):
             "nb_pages_total": nb_pages_total,
             "commentaire_additionnel": commentaire_add,
             "verdict_doc": verdict_doc,
+            "verdict_score": verdict_score,
             "nom_testeur": nom_testeur,
             "fonctionnalite": fonctionnalite,
             "test_label": f"Test {k+1}",
@@ -496,6 +580,38 @@ if uploaded_files:
         st.stop()
 
     data = pd.concat(dfs, ignore_index=True)
+
+    # ------------------------------------------------------
+    # NR écrase TUF (même doc_id + même fs_id)
+    # ------------------------------------------------------
+    overrides_report = pd.DataFrame()
+    if all(c in data.columns for c in ["doc_id", "fs_id", "fiche_type"]):
+        keep = np.ones(len(data), dtype=bool)
+        rows = []
+        for (doc, fs), g in data.groupby(["doc_id", "fs_id"], dropna=False):
+            types = set(str(x).upper() for x in g["fiche_type"].dropna().unique())
+            if "NR" in types and "TUF" in types:
+                idx_tuf = g[g["fiche_type"].str.upper() == "TUF"].index
+                keep[idx_tuf] = False
+                tuf_perf = pd.to_numeric(g.loc[idx_tuf, "verdict_score"], errors="coerce").mean() * 100
+                nr_perf = pd.to_numeric(g[g["fiche_type"].str.upper() == "NR"]["verdict_score"], errors="coerce").mean() * 100
+                tuf_verdict = g.loc[idx_tuf, "verdict_doc"].dropna().astype(str)
+                tuf_verdict = tuf_verdict.mode().iloc[0] if len(tuf_verdict) else ""
+                nr_verdict_s = g[g["fiche_type"].str.upper() == "NR"]["verdict_doc"].dropna().astype(str)
+                nr_verdict = nr_verdict_s.mode().iloc[0] if len(nr_verdict_s) else ""
+                rows.append({
+                    "doc_id": doc,
+                    "fs_id": fs,
+                    "perf_TUF": tuf_perf,
+                    "perf_NR": nr_perf,
+                    "delta_NR_minus_TUF": (nr_perf - tuf_perf) if pd.notna(nr_perf) and pd.notna(tuf_perf) else np.nan,
+                    "verdict_TUF": tuf_verdict,
+                    "verdict_NR": nr_verdict,
+                })
+        if rows:
+            overrides_report = pd.DataFrame(rows)
+            data = data.loc[keep].copy()
+
     data["fs_id"] = data["fs_id"].astype(str).str.strip()
 
     # UID stable pour pouvoir exclure des tests (❌)
@@ -511,9 +627,12 @@ if uploaded_files:
     data_f = data[~data["test_uid"].isin(excluded)].copy()
 
     # Colonnes "données extraites" (utilisées aussi pour les exports)
-    clean_cols = [
+    clean_cols_internal = [
         "test_uid",
         "fs_id",
+        "doc_id",
+        "fiche_type",
+        "fiche_name",
         "ref_coedm",
         "date_test",
         "nom_testeur",
@@ -537,6 +656,10 @@ if uploaded_files:
         "gain_temps_s",
         "verdict_doc",
     ]
+
+    # NB: "test_uid" et "doc_id" sont conservés en interne (exclusions / NR vs TUF)
+    # mais retirés de l’affichage "Données extraites" et des exports.
+    clean_cols = [c for c in clean_cols_internal if c not in ("test_uid", "doc_id")]
 
     # ==================================================================
     # CHARGEMENT RÉFÉRENTIEL (Feuil1 / Feuil2)
@@ -687,16 +810,27 @@ if uploaded_files:
     # =====================================================================
     # 1) Tableau — Performance & quantité de tests par FS
     # =====================================================================
-    st.subheader("1 — Performance & quantité de tests par FS")
+    st.subheader("1 — Perf & nb tests par FS")
     show_new = st.toggle("Afficher / masquer (1)", value=True, key="show_section_1")
     if show_new:
-        new_tab = (
+        # Quantité de tests : au niveau "test" (une ligne = un test)
+        qte_tab = (
             data_f.groupby("fs_id")
-            .agg(
-                performance=("taux_justes", "mean"),
-                quantite_tests=("test_label", "count"),
-            )
+            .agg(quantite_tests=("test_label", "count"))
             .reset_index()
+        )
+
+        # Performance : au niveau "fiche" (un fichier = un verdict)
+        perf_base = data_f.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        perf_tab = (
+            perf_base.groupby("fs_id")
+            .agg(performance_score=("verdict_score", "mean"))
+            .reset_index()
+        )
+        perf_tab["performance"] = perf_tab["performance_score"] * 100
+
+        new_tab = (
+            qte_tab.merge(perf_tab[["fs_id", "performance"]], on="fs_id", how="left")
             .rename(columns={"fs_id": "fsXX"})
         )
 
@@ -721,46 +855,85 @@ if uploaded_files:
         # Graphique double axe (comme la capture) : 2 barres par FS
         # - Quantité (bleu) sur l'axe gauche
         # - Performance (%) (rouge) sur l'axe droit
-        fig_bar, ax_qte = plt.subplots(figsize=(11, 4))
-
-        x = np.arange(len(new_tab))
-        width = 0.42
-
-        qte = pd.to_numeric(new_tab["quantite_tests"], errors="coerce").fillna(0).astype(int).values
+        # Graphique interactif (comme la capture) : 2 barres par FS
+        # - Quantité (bleu clair) sur l'axe gauche
+        # - Performance (%) (bleu foncé) sur l'axe droit
+        # + Survol : détail par classe documentaire
+        fs_order = new_tab["fsXX"].astype(str).tolist()
+        qte = pd.to_numeric(new_tab["quantite_tests"], errors="coerce").fillna(0).astype(int).tolist()
         perf = pd.to_numeric(new_tab["performance_num"], errors="coerce")
+        perf_pct = perf.fillna(0).tolist()
 
-        # Si perf est en 0..1, convertir en %
-        if perf.dropna().max() <= 1.0:
-            perf_pct = (perf * 100).fillna(0).values
-        else:
-            perf_pct = perf.fillna(0).values
 
-        ax_qte.bar(x - width/2, qte, width=width, color="tab:blue", label="Quantité de tests")
-        ax_qte.set_ylabel("Quantité de tests")
-        ax_qte.grid(True, axis="y", alpha=0.25)
+        # Détails par classe documentaire
+        tmp_detail = data_f.copy()
+        tmp_detail["fs_id"] = tmp_detail["fs_id"].astype(str).str.strip()
+        tmp_detail["classe_documentaire"] = tmp_detail.get("classe_documentaire", "").fillna("Inconnu").astype(str)
 
-        ax_perf = ax_qte.twinx()
-        ax_perf.bar(x + width/2, perf_pct, width=width, color="tab:red", label="Performance (%)")
-        ax_perf.set_ylabel("Performance (%)")
-        ax_perf.set_ylim(0, 100)
-
-        ax_qte.set_xticks(x)
-        ax_qte.set_xticklabels(new_tab["fsXX"].astype(str).tolist(), rotation=0)
-        ax_qte.set_xlabel("FS")
-
-        # Légende au-dessus pour éviter de chevaucher les barres
-        h1, l1 = ax_qte.get_legend_handles_labels()
-        h2, l2 = ax_perf.get_legend_handles_labels()
-        ax_qte.legend(
-            h1 + h2,
-            l1 + l2,
-            loc="upper center",
-            bbox_to_anchor=(0.5, 1.22),
-            ncol=2,
-            frameon=False,
+        tmp_perf_detail = tmp_detail.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        perf_by_class = (
+            tmp_perf_detail.groupby(["fs_id", "classe_documentaire"])["verdict_score"]
+            .mean()
+            .reset_index()
+        )
+        perf_by_class["perf_pct"] = perf_by_class["verdict_score"] * 100
+        qte_by_class = (
+            tmp_detail.groupby(["fs_id", "classe_documentaire"])            .size()            .reset_index(name="nb")
         )
 
-        st.pyplot(fig_bar, use_container_width=True)
+        def _hover_perf(fs: str, overall: float) -> str:
+            sub = perf_by_class[perf_by_class["fs_id"] == fs].copy()
+            sub = sub.sort_values("classe_documentaire")
+            lines = [f"<b>{overall:.1f}%</b> (performance totale)"]
+            for _, r in sub.iterrows():
+                val = r["perf_pct"]
+                if pd.notna(val):
+                    lines.append(f"Classe doc {r['classe_documentaire']} : {val:.1f}%")
+            return "<br>".join(lines)
+
+        def _hover_qte(fs: str, total: int) -> str:
+            sub = qte_by_class[qte_by_class["fs_id"] == fs].copy()
+            sub = sub.sort_values("classe_documentaire")
+            lines = [f"<b>{total} tests</b> (total)"]
+            for _, r in sub.iterrows():
+                lines.append(f"Classe doc {r['classe_documentaire']} : {int(r['nb'])}")
+            return "<br>".join(lines)
+
+        hover_perf = [_hover_perf(fs, float(p)) for fs, p in zip(fs_order, perf_pct)]
+        hover_qte = [_hover_qte(fs, int(t)) for fs, t in zip(fs_order, qte)]
+
+        fig_bar = go.Figure()
+        fig_bar.add_bar(
+            x=fs_order,
+            y=qte,
+            name="Quantité de tests",
+            marker_color="#a7d2ff",
+            hovertext=hover_qte,
+            hoverinfo="text",
+            offsetgroup="qte",
+            alignmentgroup="fs",
+        )
+        fig_bar.add_bar(
+            x=fs_order,
+            y=perf_pct,
+            name="Performance (%)",
+            marker_color="#063970",
+            yaxis="y2",
+            hovertext=hover_perf,
+            hoverinfo="text",
+            offsetgroup="perf",
+            alignmentgroup="fs",
+        )
+
+        fig_bar.update_layout(
+            barmode="group",
+            xaxis=dict(title="FS"),
+            yaxis=dict(title="Quantité de tests", rangemode="tozero"),
+            yaxis2=dict(title="Performance (%)", overlaying="y", side="right", range=[0, 100]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5),
+            margin=dict(t=80, b=40, l=40, r=40),
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
     # =====================================================================
     # 2) KPI globaux
@@ -782,7 +955,42 @@ if uploaded_files:
     c3.metric("FS testées", nb_fs)
     c4.metric("Testeurs", nb_testeurs)
 
-    # ---------------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # Remplacements NR vs TUF (NR écrase TUF) + warning si NR < TUF
+    # -----------------------------------------------------------------
+    if isinstance(overrides_report, pd.DataFrame) and len(overrides_report):
+        st.subheader("Remplacements NR vs TUF")
+        st.info(
+            f"{int(len(overrides_report))} cas : une fiche NR a remplacé une fiche TUF (même doc_id + même FS)."
+        )
+
+        disp_all = overrides_report.copy()
+
+        # Numériser pour détecter NR < TUF
+        for c in ["perf_TUF", "perf_NR", "delta_NR_minus_TUF"]:
+            if c in disp_all.columns:
+                disp_all[c] = pd.to_numeric(disp_all[c], errors="coerce")
+
+        worse = disp_all.copy()
+        if "delta_NR_minus_TUF" in worse.columns:
+            worse = worse[worse["delta_NR_minus_TUF"] < 0]
+
+        if len(worse):
+            st.warning("⚠️ Attention : NR < TUF sur la performance moyenne pour certains remplacements.")
+
+        disp_show = disp_all.copy()
+        for c in ["perf_TUF", "perf_NR", "delta_NR_minus_TUF"]:
+            if c in disp_show.columns:
+                disp_show[c] = disp_show[c].map(lambda x: "" if pd.isna(x) else f"{x:.1f}%")
+
+        st.dataframe(
+            disp_show[
+                ["doc_id", "fs_id", "verdict_TUF", "verdict_NR", "perf_TUF", "perf_NR", "delta_NR_minus_TUF"]
+            ],
+            use_container_width=True,
+        )
+
+# ---------------------------------------------------------------------
     # Graphique unique : volume de tests + performance dans le temps
     # (axe X datetime => dates espacées proportionnellement)
     # ---------------------------------------------------------------------
@@ -790,7 +998,7 @@ if uploaded_files:
     # Graphique : évolution CUMULÉE du nombre total de tests (courbe qui grimpe)
     # (axe X datetime => dates espacées proportionnellement)
     # ---------------------------------------------------------------------
-    st.subheader("4 — Évolution cumulée du nombre total de tests")
+    st.subheader("4 — Évolution cumulée tests")
 
     if "date_test" in data_f.columns:
         import matplotlib.dates as mdates
@@ -835,7 +1043,7 @@ if uploaded_files:
     else:
         st.info("Aucune colonne 'date_test' détectée : impossible d'afficher l'évolution des tests dans le temps.")
 
-    st.subheader("5 — Taux de justesse moyen (FS testées)")
+    st.subheader("5 — Justesse moyenne FS")
     show_tab2bis = st.toggle("Afficher / masquer", value=True, key="show_2bis")
     if show_tab2bis:
         tab2bis, fo_cols_2bis = build_tab2bis(data_f, ref_base)
@@ -847,7 +1055,7 @@ if uploaded_files:
     # =====================================================================
     # 4) Tableau 3 (progression)
     # =====================================================================
-    st.subheader("6 — Progression des tests (FS testés uniquement)")
+    st.subheader("6 — Progression tests FS")
     show_tab3 = st.toggle("Afficher / masquer", value=True, key="show_3")
     if show_tab3:
         fs_testes = data_f["fs_id"].unique()
@@ -984,7 +1192,7 @@ if uploaded_files:
     # =====================================================================
     # 9) Taux de justesse par classe doc
     # =====================================================================
-    st.subheader("10 — Taux de justesse par classe documentaire")
+    st.subheader("10 — Justesse par classe doc")
     show_taux_cd = st.toggle("Afficher / masquer taux par classe doc", value=False)
     if show_taux_cd:
         if "classe_documentaire" in data_f.columns:
@@ -1102,6 +1310,7 @@ if uploaded_files:
     show_data = st.toggle("Afficher / masquer données extraites", value=False)
     if show_data:
 
+        # Affichage complet (non filtré) — SANS doc_id / test_uid
         df_clean_all = data[clean_cols].copy()
         if "date_test" in df_clean_all.columns:
             df_clean_all["date_test"] = pd.to_datetime(df_clean_all["date_test"], errors="coerce").dt.date
@@ -1109,31 +1318,31 @@ if uploaded_files:
         num_cols = df_clean_all.select_dtypes(include=["float", "int"]).columns
         df_clean_all[num_cols] = df_clean_all[num_cols].round(2)
 
-        # Editor pour exclure des tests
-        df_editor = df_clean_all[["test_uid", "fs_id", "ref_coedm", "test_label", "verdict_doc"]].copy()
-        df_editor["❌ Exclure"] = df_editor["test_uid"].isin(st.session_state["excluded_test_uids"])
+        # Editor pour exclure des tests (ID interne via l'index, non affiché)
+        df_editor = data[["test_uid", "fs_id", "ref_coedm", "test_label", "verdict_doc"]].copy()
+        df_editor = df_editor.set_index("test_uid")
+        df_editor["❌ Exclure"] = df_editor.index.isin(st.session_state["excluded_test_uids"])
 
         st.caption("Cochez ❌ Exclure pour ignorer des lignes (cela mettra à jour tous les tableaux).")
         edited = st.data_editor(
-            df_editor,
+            df_editor[["fs_id", "ref_coedm", "test_label", "verdict_doc", "❌ Exclure"]],
             hide_index=True,
             column_config={
-                "test_uid": st.column_config.NumberColumn("ID", disabled=True),
                 "fs_id": st.column_config.TextColumn("FS", disabled=True),
                 "ref_coedm": st.column_config.TextColumn("Document", disabled=True),
                 "test_label": st.column_config.TextColumn("Test", disabled=True),
                 "verdict_doc": st.column_config.TextColumn("Verdict", disabled=True),
                 "❌ Exclure": st.column_config.CheckboxColumn("❌ Exclure"),
             },
-            disabled=["test_uid", "fs_id", "ref_coedm", "test_label", "verdict_doc"],
+            disabled=["fs_id", "ref_coedm", "test_label", "verdict_doc"],
             use_container_width=True,
         )
 
         # Mettre à jour la session_state
-        new_excluded = set(edited.loc[edited["❌ Exclure"], "test_uid"].astype(int).tolist())
+        new_excluded = set(edited.index[edited["❌ Exclure"]].astype(int).tolist())
         st.session_state["excluded_test_uids"] = new_excluded
 
-        # Affichage data filtrée, avec couleur verdict
+        # Affichage data filtrée, avec couleur verdict (SANS doc_id / test_uid)
         df_clean_f = data_f[clean_cols].copy()
         if "date_test" in df_clean_f.columns:
             df_clean_f["date_test"] = pd.to_datetime(df_clean_f["date_test"], errors="coerce").dt.date
@@ -1141,11 +1350,7 @@ if uploaded_files:
         df_clean_f[num_cols_f] = df_clean_f[num_cols_f].round(2)
 
         st.dataframe(df_clean_f.style.applymap(color_verdict, subset=["verdict_doc"]))
-
-    # =====================================================================
-    # 13) Résultat par type de document
-    # =====================================================================
-    st.subheader("14 — Résultat par type de document")
+    st.subheader("14 — Résultats par type doc")
     show_type = st.toggle("Afficher / masquer résultats par type de doc", value=False)
     if show_type:
         summary = (
@@ -1166,26 +1371,7 @@ if uploaded_files:
     # 14) Exports
     # =====================================================================
     st.subheader("15 — Export")
-
-    # 1) CSV brut des tests (filtré)
-    st.download_button(
-        "Exporter les données détaillées (CSV)",
-        data=data_f.drop(columns=["test_uid"]).to_csv(index=False).encode("utf-8"),
-        file_name="resultats_ia_detail_filtre.csv",
-        mime="text/csv"
-    )
-
     # 2) Export suivi recettage (Excel) — filtré
-    def verdict_to_score(v):
-        v_norm = norm_verdict(v)
-        if v_norm == "bon":
-            return 1.0
-        if v_norm == "partiel":
-            return 0.5
-        if v_norm == "mauvais":
-            return 0.0
-        return np.nan
-
     recettage_df = data_f[
         ["fs_id", "verdict_doc", "classe_documentaire", "site", "ref_coedm"]
     ].copy()
@@ -1261,7 +1447,7 @@ if uploaded_files:
     tab3_display = tab3_x.drop(columns=["complexité"])
 
     # Données extraites filtrées
-    clean_cols_export = [c for c in clean_cols if c != "test_uid"]
+    clean_cols_export = clean_cols
     df_clean_export = data_f[clean_cols_export].copy()
     if "date_test" in df_clean_export.columns:
         df_clean_export["date_test"] = pd.to_datetime(df_clean_export["date_test"], errors="coerce").dt.date
@@ -1295,15 +1481,64 @@ if uploaded_files:
         .reset_index()
     )
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        tab2bis_xlsx.to_excel(writer, sheet_name="Tableau_2bis", index=False)
-        tab3_display.to_excel(writer, sheet_name="Tableau_3", index=False)
-        kpi_fct_export.to_excel(writer, sheet_name="KPI_par_fonctionnalite", index=False)
-        summary_export.to_excel(writer, sheet_name="Resultat_par_type_doc", index=False)
-        df_clean_export.to_excel(writer, sheet_name="Donnees_extraites", index=False)
+    # Tableau perf/quantité par FS (filtré) — pour l'export
+    perfqte_export = (
+        data_f.groupby('fs_id')
+        .agg(performance=('taux_justes','mean'), quantite_tests=('test_label','count'))
+        .reset_index()
+        .rename(columns={'fs_id':'fs'})
+    )
+    perfqte_export['performance'] = pd.to_numeric(perfqte_export['performance'], errors='coerce')
+    perfqte_export['performance_%'] = perfqte_export['performance'].map(lambda x: '' if pd.isna(x) else f"{x:.1f}%")
 
-        # Formats Excel (couleurs) — appliqués à Tableau_3 et aux verdicts (Tableau_2bis neutre)
+    output = BytesIO()
+
+    # Titres (doivent être identiques aux sous-titres Streamlit et compatibles Excel)
+    TITLE_PERF_FS = "1 — Perf & nb tests par FS"
+    TITLE_JUSTESSE_FS = "5 — Justesse moyenne FS"
+    TITLE_PROG_FS = "6 — Progression tests FS"
+    TITLE_REPL = "Remplacements NR vs TUF"
+    TITLE_JUSTESSE_CD = "10 — Justesse par classe doc"
+    TITLE_KPI_FCT = "11 — KPI par fonctionnalité"
+    TITLE_DATA = "13 — Données extraites"
+    TITLE_TYPE_DOC = "14 — Résultats par type doc"
+
+    # 1) Perf / quantité par FS (filtré)
+    perf_fs_export = (
+        perfqte_export[["fs", "performance_%", "quantite_tests"]]
+        .rename(columns={"fs": "fsXX", "performance_%": "performance", "quantite_tests": "quantité de tests"})
+        .copy()
+    )
+
+    # 10) Justesse par classe doc (filtré)
+    justesse_cd_export = pd.DataFrame()
+    if "classe_documentaire" in data_f.columns:
+        justesse_cd_export = (
+            data_f.groupby("classe_documentaire")
+            .agg(
+                nb_tests=("test_label", "count"),
+                taux_justes_moy=("taux_justes", "mean"),
+            )
+            .reset_index()
+        )
+        justesse_cd_export["taux_justes_moy"] = justesse_cd_export["taux_justes_moy"].round(2)
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        perf_fs_export.to_excel(writer, sheet_name=excel_sheet_name(TITLE_PERF_FS), index=False)
+        tab2bis_xlsx.to_excel(writer, sheet_name=excel_sheet_name(TITLE_JUSTESSE_FS), index=False)
+        tab3_display.to_excel(writer, sheet_name=excel_sheet_name(TITLE_PROG_FS), index=False)
+
+        if isinstance(overrides_report, pd.DataFrame) and len(overrides_report):
+            overrides_report.to_excel(writer, sheet_name=excel_sheet_name(TITLE_REPL), index=False)
+
+        if isinstance(justesse_cd_export, pd.DataFrame) and len(justesse_cd_export):
+            justesse_cd_export.to_excel(writer, sheet_name=excel_sheet_name(TITLE_JUSTESSE_CD), index=False)
+
+        kpi_fct_export.to_excel(writer, sheet_name=excel_sheet_name(TITLE_KPI_FCT), index=False)
+        summary_export.to_excel(writer, sheet_name=excel_sheet_name(TITLE_TYPE_DOC), index=False)
+        df_clean_export.to_excel(writer, sheet_name=excel_sheet_name(TITLE_DATA), index=False)
+
+        # Formats Excel (couleurs)
         workbook = writer.book
 
         fmt_red = workbook.add_format({"bg_color": "#fb3f35"})
@@ -1316,19 +1551,26 @@ if uploaded_files:
         fmt_verdict_partiel = workbook.add_format({"bg_color": "#FFE699", "font_color": "#7F6000", "bold": True})
         fmt_verdict_mauvais = workbook.add_format({"bg_color": "#fb3f35", "font_color": "#9C0006", "bold": True})
 
-        # Tableau_2bis : pas de mise en couleur (affichage neutre)
+        # Couleurs % dans "Justesse moyenne FS"
+        ws2 = writer.sheets[excel_sheet_name(TITLE_JUSTESSE_FS)]
+        n_rows_2 = len(tab2bis_xlsx)
 
+        def _simple_pct(val):
+            if not isinstance(val, str):
+                return None
+            s = val.strip().replace("%", "").replace(",", ".")
+            if not s:
+                return None
+            try:
+                return float(s)
+            except Exception:
+                return None
 
-
-        # Couleurs dans Tableau_3
-        ws3 = writer.sheets["Tableau_3"]
-        n_rows_3 = len(tab3_display)
-
-        for r in range(n_rows_3):
-            for fo in fo_cols:
-                c_idx = tab3_display.columns.get_loc(fo)
-                val = tab3_display.iloc[r, c_idx]
-                pct = extract_pct(val)
+        for r in range(n_rows_2):
+            for fo in fo_cols_2bis:
+                c_idx = tab2bis_xlsx.columns.get_loc(fo)
+                val = tab2bis_xlsx.iloc[r, c_idx]
+                pct = _simple_pct(val)
                 if pct is None:
                     continue
                 if pct < 25:
@@ -1341,10 +1583,10 @@ if uploaded_files:
                     fmt = fmt_light_green
                 else:
                     fmt = fmt_dark_green
-                ws3.write(r + 1, c_idx, val, fmt)
+                ws2.write(r + 1, c_idx, val, fmt)
 
-        # Couleurs verdict dans Donnees_extraites
-        wsD = writer.sheets["Donnees_extraites"]
+        # Couleurs verdict dans "Données extraites"
+        wsD = writer.sheets[excel_sheet_name(TITLE_DATA)]
         n_rows_D = len(df_clean_export)
         verdict_col_idx = df_clean_export.columns.get_loc("verdict_doc")
 
@@ -1362,6 +1604,7 @@ if uploaded_files:
             else:
                 continue
             wsD.write(r + 1, verdict_col_idx, val, fmt)
+
 
     st.download_button(
         "Exporter les tableaux (Excel)",
