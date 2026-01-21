@@ -5,3 +5,5 @@ matplotlib>=3.7.0
 python-dateutil>=2.8.2
 openpyxl
 XlsxWriter
+plotly>=5.18.0
+
