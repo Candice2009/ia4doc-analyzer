@@ -1,4 +1,3 @@
-
 import re
 import streamlit as st
 import pandas as pd
@@ -10,214 +9,28 @@ import os
 import io
 import zipfile
 import unicodedata
+from io import BytesIO
+from openpyxl import load_workbook, Workbook
 
-
-st.set_page_config(page_title='Analyse Fiches IA4Doc', layout='wide')
-
-# --- Version affichée pour éviter les confusions ---
-# ---------------------------------------------------------------------
-
-def _normalize_text(s: object) -> str:
-    """Normalise un texte (minuscule, sans accents, espaces simplifiés)."""
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    # Retire les accents
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"\s+", " ", s)
-    return s
-
+st.set_page_config(page_title='IA4Doc – KPI & Analyse Fiches', layout='wide')
 
 def verdict_to_score(verdict: object) -> float:
-    """Mappe le verdict doc vers un score [0..1] : bon=1, partiel=0.5, mauvais=0."""
-    v = _normalize_text(verdict)
-    if not v:
+    """Mappe strictement le verdict vers un score : bon=1, partiel=0.5, mauvais=0."""
+    if not isinstance(verdict, str):
         return np.nan
-
-    # Cas négatifs explicites
-    if "pas bon" in v or "non bon" in v:
-        return 0.0
-
-    # Priorité au partiel
-    if "partiel" in v:
-        return 0.5
-
-    # Bon / OK
-    if re.search(r"\bbon\b", v) or v.startswith("bon") or v in {"ok", "valide", "validee", "valide.", "conforme"}:
+    
+    v = verdict.strip() # On garde juste le retrait des espaces inutiles
+    
+    if v == "Bon":
         return 1.0
-
-    # Mauvais / KO
-    if "mauvais" in v or re.search(r"\bko\b", v) or v.startswith("ko"):
+    if v == "Partiellement bon":
+        return 0.5
+    if v == "Mauvais":
         return 0.0
+        
+    return np.nan # Si c'est vide ou écrit autrement
 
-    return np.nan
-# Helpers
 # ---------------------------------------------------------------------
-def infer_fo_cols(df: pd.DataFrame) -> list[str]:
-    """Détecte automatiquement les colonnes foN (fo1, fo2, ...), triées numériquement.
-    Permet d'inclure fo10/fo11 (et +) sans modifier le code.
-    """
-    cols = []
-    for c in df.columns:
-        cs = str(c).strip()
-        if re.match(r"^fo\d+$", cs):
-            cols.append(cs)
-    def _k(x: str) -> int:
-        m = re.search(r"(\d+)$", x)
-        return int(m.group(1)) if m else 0
-    return sorted(cols, key=_k)
-
-
-def excel_sheet_name(title: str) -> str:
-    """Noms de feuilles Excel : identiques aux titres Streamlit, mais compatibles Excel.
-    - max 31 caractères
-    - suppression des caractères interdits : : \ / ? * [ ]
-    """
-    if not isinstance(title, str):
-        title = str(title)
-    # Caractères interdits Excel
-    title = re.sub(r"[:\\/\?\*\[\]]", "", title)
-    title = title.strip().strip("'")
-    if not title:
-        title = "Feuil1"
-    return title[:31]
-
-
-# =====================================================================
-# STYLES / COULEURS
-# =====================================================================
-
-def color_verdict(val):
-    if not isinstance(val, str):
-        return ""
-    v = val.strip().lower()
-    if v == "bon":
-        return "background-color: #c6efce; color: #006100; font-weight: bold;"
-    if "partiellement" in v:
-        return "background-color: #ffe699; color: #7f6000; font-weight: bold;"
-    if "mauvais" in v:
-        return "background-color: #fd4a4a; color: #9c0006; font-weight: bold;"
-    return ""
-
-
-def extract_pct(cell):
-    if not isinstance(cell, str):
-        return None
-    cell = cell.strip()
-    if not cell or cell in ("tbd", "NA"):
-        return None
-    if "(" not in cell or "%" not in cell:
-        return None
-    try:
-        inside = cell.split("(")[1].split(")")[0]   # ex: '0.7%' ou '25.0%'
-        inside = inside.replace("%", "").replace(",", ".")
-        return float(inside)
-    except Exception:
-        return None
-
-
-def color_tab3(val):
-    pct = extract_pct(val)
-    if pct is None:
-        return ""
-    # pct est en pourcentage (0–100)
-    if pct < 25:
-        return "background-color: #fd4a4a;"               # rouge
-    elif pct < 50:
-        return "background-color: #f4b183;"               # orange
-    elif pct < 75:
-        return "background-color: #fff2cc;"               # jaune
-    elif pct < 90:
-        return "background-color: #c6efce;"               # vert clair
-    else:
-        return "background-color: #00b050; color: white;" # vert foncé
-
-
-def build_tab2bis(data, ref_base):
-    # FS réellement testés
-    fs_testes = data["fs_id"].astype(str).str.strip().unique()
-    tab2bis = ref_base[ref_base["N° fs"].isin(fs_testes)].copy()
-
-    # moyenne performance (verdict) par FS : bon=100%, partiel=50%, mauvais=0%
-    tmp = data.copy()
-    tmp["__score__"] = tmp["verdict_doc"].apply(verdict_to_score) * 100.0
-    taux_fs = (
-        tmp.groupby("fs_id")["__score__"]
-        .mean()
-        .rename(lambda x: str(x).strip())
-        .to_dict()
-    )
-
-    fo_cols = infer_fo_cols(ref_base)
-    def fill_cell(row, fo):
-        val = row[fo]
-        if val != "x":
-            return ""
-        fs = row["N° fs"]
-        actual = taux_fs.get(fs)
-        if actual is None or pd.isna(actual):
-            return ""
-        return f"{actual:.1f}%"
-
-    for fo in fo_cols:
-        tab2bis[fo] = tab2bis.apply(lambda r: fill_cell(r, fo), axis=1)
-
-    return tab2bis, fo_cols
-
-
-def style_tab2bis(df, fo_cols):
-    styles = _DataFrame("", index=df.index, columns=df.columns)
-
-    for i in df.index:
-        for fo in fo_cols:
-            val = df.at[i, fo]
-            if not isinstance(val, str) or not val:
-                continue
-            if val in ("tbd", "NA"):
-                continue
-            try:
-                pct = float(val.replace("%", "").replace(",", "."))
-            except Exception:
-                continue
-
-            if pct < 25:
-                styles.at[i, fo] = "background-color: #fd4a4a;"
-            elif pct < 50:
-                styles.at[i, fo] = "background-color: #f4b183;"
-            elif pct < 75:
-                styles.at[i, fo] = "background-color: #fff2cc;"
-            elif pct < 90:
-                styles.at[i, fo] = "background-color: #c6efce;"
-            else:
-                styles.at[i, fo] = "background-color: #00b050; color: white;"
-
-    return styles
-
-
-def norm_verdict(x: str) -> str:
-    if not isinstance(x, str):
-        return "none"
-    x = x.strip().lower()
-    if x in ("", "nan", "none"):
-        return "none"
-    if x == "bon":
-        return "bon"
-    if "partiel" in x:
-        return "partiel"
-    if "mauvais" in x:
-        return "mauvais"
-    return "none"
-
-
-
-def extract_modification(ref):
-    if not isinstance(ref, str):
-        return ""
-    ref = ref.strip()
-    match = re.search(r"(m\d{2})$", ref, re.IGNORECASE)
-    return match.group(1) if match else ""
-
 
 def extract_doc_id(ref: str) -> str:
     """Extrait un identifiant de document depuis la référence (nom de fichier).
@@ -241,20 +54,25 @@ def extract_doc_id(ref: str) -> str:
 # PARSE FICHE
 # =====================================================================
 
+#permet de lire les cases des fiches de test
+
 def parse_fiche(file):
     filename = file.name
 
     if filename.startswith("~$"):
-        return pd.DataFrame()  # fichier temporaire Excel => on ignore
+        return pd.DataFrame()  # fichier temporaire Excel => on ignore (j'ai déja rencontré le cas, d'où cette sécurité)
 
     # Exemples de noms :
     # - fs60-IA-v00-TUF-FFP_PV_...-Fiche-v01-CM.xlsx
     # - fs1-IA-v00-NR-...-Fiche-v01-CM.xlsx (fs 1 à 3 chiffres)
     filename_clean = str(filename).strip()
 
-    pat = r"^(fs\d{1,3})-IA-v\d+-(TUF|NR)-(.+)-Fiche-v\d+-[A-Za-z]+\.xlsx$"
+    # --- 1. Analyse du NOM du fichier ---
+    # Vérifie si le nom respecte le format strict fsXX-IA-vXX..
+    pat = r"^(fs\d{1,3})-IA-v\d+-(TUF|NR)-(.+)-Fiche-v\d+-[A-Za-z]+\.xlsx$" # si le nom des fiches change, c'est ici qu'il faut faire les modifs !
     m = re.match(pat, filename_clean, flags=re.IGNORECASE)
     if not m:
+        # Si le nom est mauvais, le script s'arrête ici pour ce fichier
         raise ValueError(
             "Nom de fichier invalide. Format attendu : "
             "fs<1-3 chiffres>-IA-vXX-(TUF|NR)-<ref>-Fiche-vXX-<initiales>.xlsx"
@@ -265,11 +83,11 @@ def parse_fiche(file):
     ref_from_filename = m.group(3)
     doc_id = extract_doc_id(ref_from_filename)
 
-
+    # après upload des fiches de test, l'outil va lire la feuille "Template Fiche de Test" <- si le nom de la feuille excel change c'est ici qu'il faut modifier 
     df = pd.read_excel(file, sheet_name="Template Fiche de Test", header=None)
 
     # -----------------------------------------------------------------
-    # Détection du décalage : ligne 18 contient-elle "*Searchable:" ?
+    # Détection du décalage : ligne 18 contient-elle "*Searchable:" ? (après la nouvelle version du template des fiches de test)
     # -----------------------------------------------------------------
     has_searchable_row = False
     try:
@@ -290,7 +108,7 @@ def parse_fiche(file):
         return base_row
 
     # ===========================
-    # Champs "avant 18"
+    # Champs "avant 18" Récupération des infos générales (En-tête de fiche)
     # ===========================
     type_test = df.iloc[4, 1] if pd.notna(df.iloc[4, 1]) else None
     type_doc = df.iloc[14, 1] if pd.notna(df.iloc[14, 1]) else None
@@ -330,6 +148,15 @@ def parse_fiche(file):
     except Exception:
         pass
 
+    # Code modification (B22)
+    code_modif = None
+    try:
+        val_modif = df.iloc[21, 1]  # B22
+        if isinstance(val_modif, str) and val_modif.strip():
+            code_modif = val_modif.strip()
+    except Exception:
+        pass
+    
 
     # Classe documentaire (D15 → ligne 15, index 14) = avant 18
     classe_documentaire = None
@@ -418,10 +245,12 @@ def parse_fiche(file):
         tests = []
 
     records = []
+    # Pour chaque test trouvé...
     for k in range(len(tests)):
-        col = 2 + k
+        col = 2 + k # Décalage de colonnes (C=2, D=3...)
 
         # lignes 32..37 → index 31..36 → après 18 → offset
+        # On récupère les lignes de résultats (Temps, FN, FP...)
         row_h = r(31)
         row_m = r(32)
         row_j = r(33)
@@ -455,6 +284,7 @@ def parse_fiche(file):
         fp = to_float_or_none(raw_vals[4])
         inc = to_float_or_none(raw_vals[5])
 
+        # Création de l'objet résultat
         rec = {
             "fs_id": fs_id,
             "ref_coedm": ref_coedm,
@@ -467,6 +297,7 @@ def parse_fiche(file):
             "classe_documentaire": classe_documentaire,
             "site": site,
             "label_fonctionnalite": label_fonctionnalite,
+            "code_modif": code_modif,
             "nb_pages_total": nb_pages_total,
             "commentaire_additionnel": commentaire_add,
             "verdict_doc": verdict_doc,
@@ -481,7 +312,7 @@ def parse_fiche(file):
             "fp": fp,
             "incertaines": inc,
         }
-
+        # Calcul des pourcentages
         if nb_pages_total and nb_pages_total != 0:
             rec["taux_justes"] = (justes / nb_pages_total * 100) if justes is not None else None
             rec["taux_fn"] = (fn / nb_pages_total * 100) if fn is not None else None
@@ -510,11 +341,21 @@ def parse_fiche(file):
 
 st.title("Analyse automatique des fiches IA4Doc")
 
+# Zone de glisser-déposer des fichiers
 uploaded_files = st.file_uploader(
     "Fichiers Excel ou ZIP",
     type=["xlsx", "zip"],
     accept_multiple_files=True
+,
+    key="fiches_top"
 )
+
+if uploaded_files:
+    st.session_state["fiches_uploaded_files"] = uploaded_files
+else:
+    st.session_state.setdefault("fiches_uploaded_files", [])
+
+
 
 def iter_excel_files(uploaded_files):
     """
@@ -529,32 +370,1110 @@ def iter_excel_files(uploaded_files):
         # 1) Cas ZIP
         if fname.endswith(".zip"):
             try:
-                with zipfile.ZipFile(up) as zf:
+                # Remet le curseur au début (Streamlit peut relire le même objet)
+                try:
+                    up.seek(0)
+                except Exception:
+                    pass
+
+                zbytes = up.read()
+                with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
                     for member in zf.namelist():
-                        if not member.lower().endswith(".xlsx"):
+                        if member.endswith("/") or (not member.lower().endswith(".xlsx")):
                             continue
                         data = zf.read(member)
                         bio = io.BytesIO(data)
-                        # On donne un "name" pour que parse_fiche puisse l'utiliser
                         bio.name = os.path.basename(member)
+                        try:
+                            bio.seek(0)
+                        except Exception:
+                            pass
                         yield bio
             except Exception as e:
-                st.error(f"Erreur en lisant le zip {up.name} : {e}")
-
-        # 2) Cas Excel direct
+                st.error(f"Erreur en lisant le zip {up.name} : {e}")# 2) Cas Excel direct
         elif fname.endswith(".xlsx"):
             yield up
 
 
+# =============================================================
+# KPI (Tableaux + Graphiques) — AU DÉBUT
+# =============================================================
+
+from datetime import datetime, time as _time, date as _date
+from openpyxl.utils import get_column_letter
+
+# --- CDC parsing rules (prompt KPI)
+_IB_SET = {"IBT", "IC"}
+_PCM_SET = {"STMA", "JMT", "FLC"}
+
+def _is_blank(v) -> bool:
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+def _to_excel_datetime(d: _date) -> datetime:
+    return datetime.combine(d, _time.min)
+
+def _excel_col_letters(start: str, end: str) -> list[str]:
+    def col_to_num(c):
+        n = 0
+        for ch in c:
+            n = n*26 + (ord(ch.upper()) - 64)
+        return n
+    def num_to_col(n):
+        s = ""
+        while n:
+            n, r = divmod(n-1, 26)
+            s = chr(65+r) + s
+        return s
+    a, b = col_to_num(start), col_to_num(end)
+    return [num_to_col(i) for i in range(a, b+1)]
+
+_COMMON_MARK_COLS = _excel_col_letters("AK", "AR")
+
+def parse_cdc_functions(cdc_bytes: bytes) -> pd.DataFrame:
+    """Lit le CDC (feuille 1-Fonctionnalités) et renvoie : ID fonctionnalité, Catégorie, État"""
+    from openpyxl import load_workbook
+    wb = load_workbook(BytesIO(cdc_bytes), data_only=True)
+    if "1-Fonctionnalités" not in wb.sheetnames:
+        raise ValueError("Feuille '1-Fonctionnalités' introuvable dans le CDC.")
+    ws = wb["1-Fonctionnalités"]
+
+    rows = []
+    for r in range(4, ws.max_row + 1):
+        func_id = ws[f"B{r}"].value
+        if _is_blank(func_id):
+            continue
+
+        flag_a = ws[f"A{r}"].value
+        origin = ws[f"C{r}"].value
+        state = ws[f"AI{r}"].value
+
+        has_mark = False
+        for col in _COMMON_MARK_COLS:
+            v = ws[f"{col}{r}"].value
+            if not _is_blank(v):
+                has_mark = True
+                break
+
+        rows.append({
+            "row": r,
+            "flag_a": flag_a,
+            "func_id": str(func_id).strip(),
+            "origin": str(origin).strip() if not _is_blank(origin) else "",
+            "state": str(state).strip() if not _is_blank(state) else "",
+            "has_mark": has_mark,
+        })
+
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw
+
+    def flag_is_one(x) -> bool:
+        if x is None:
+            return False
+        s = str(x).strip().lower()
+        return s == "1" or s == "oui"
+
+    out_rows = []
+    for func_id, g in raw.groupby("func_id", sort=False):
+        g = g.copy()
+        base = g[g["flag_a"].apply(flag_is_one)]
+        base_row = base.iloc[0] if len(base) else g.iloc[0]
+
+        base_origin = (base_row["origin"] or "").strip()
+        base_state = (base_row["state"] or "").strip()
+
+        is_common = (base_origin.lower() == "ib et pcm") and bool(g["has_mark"].any())
+        if is_common:
+            marked = g[g["has_mark"] == True]
+            marked_origins = set([str(o).strip() for o in marked["origin"].tolist() if not _is_blank(o)])
+            has_ib = any(o in _IB_SET for o in marked_origins)
+            has_pcm = any(o in _PCM_SET for o in marked_origins)
+
+            if has_ib and has_pcm:
+                category = "Commun universel"
+            elif has_ib:
+                category = "Commun spécifique IB"
+            elif has_pcm:
+                category = "Commun spécifique PCM"
+            else:
+                category = "Commun universel"
+        else:
+            bo = base_origin.strip()
+            if bo == "PCM":
+                category = "PCM"
+            elif bo == "IB":
+                category = "IB"
+            elif bo.lower() == "ib et pcm":
+                non_flag = g[~g["flag_a"].apply(flag_is_one)]
+                origins = set([str(o).strip() for o in non_flag["origin"].tolist() if not _is_blank(o)])
+                if any(o in _IB_SET for o in origins):
+                    category = "IB"
+                elif any(o in _PCM_SET for o in origins):
+                    category = "PCM"
+                else:
+                    category = "IB"
+            else:
+                category = bo if bo else "Autre"
+
+        out_rows.append({
+            "ID fonctionnalité": func_id,
+            "Catégorie": category,
+            "État": base_state,
+        })
+
+    return pd.DataFrame(out_rows)
+
+# --- Historique tableaux_hebdo.xlsx (template)
+_T1_TITLE = "Nombre de fonctionnalités en test"
+_T3_TITLE = "Nombre de Fiche de Test remplies"
+
+# dans votre template:
+# - Tableau 1 : titre en B3, dates en C3.., labels en B4..B8
+# - Tableau 3 : titre en B12, dates en C12.., labels en B13.. (types doc)
+# - Tableau 2 : dates en C20.. (B20 vide), labels en B21..B27 dont Total
+
+def _find_row_by_title(ws, title: str) -> int | None:
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 2).value
+        if isinstance(v, str) and v.strip() == title:
+            return r
+    return None
+
+def _read_date_headers(ws, row: int, start_col: int = 3) -> list[_date]:
+    out = []
+    c = start_col
+    while True:
+        v = ws.cell(row, c).value
+        if v is None:
+            break
+        if isinstance(v, datetime):
+            out.append(v.date())
+        elif isinstance(v, _date):
+            out.append(v)
+        else:
+            try:
+                out.append(pd.to_datetime(v).date())
+            except Exception:
+                break
+        c += 1
+    return out
+
+def _find_or_append_date_col(ws, row: int, snap: _date, start_col: int = 3) -> int:
+    dates = _read_date_headers(ws, row, start_col=start_col)
+    if snap in dates:
+        return start_col + dates.index(snap)
+    col = start_col + len(dates)
+    ws.cell(row, col).value = _to_excel_datetime(snap)
+    return col
+
+def _read_block(ws, title_row: int, labels_start_row: int, stop_on_blank: bool = True) -> pd.DataFrame:
+    """Retourne df index=labels(col B), columns=dates (date headers row=title_row)"""
+    dates = _read_date_headers(ws, title_row, start_col=3)
+    # labels
+    labels = []
+    r = labels_start_row
+    while True:
+        v = ws.cell(r, 2).value
+        if stop_on_blank and _is_blank(v):
+            break
+        if _is_blank(v):
+            labels.append("")
+        else:
+            labels.append(str(v).strip())
+        r += 1
+        # safety
+        if r > ws.max_row + 50:
+            break
+
+    # build
+    data = {}
+    for i, d in enumerate(dates):
+        col = 3 + i
+        col_vals = []
+        for rr in range(labels_start_row, labels_start_row + len(labels)):
+            v = ws.cell(rr, col).value
+            col_vals.append(0 if v is None else v)
+        data[d] = col_vals
+
+    df = pd.DataFrame(data, index=labels)
+    df.index.name = None
+    df = df.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+    # drop empty label rows
+    df = df[df.index.astype(str).str.strip() != ""]
+    return df
+
+def _ensure_labels(ws, labels_start_row: int, existing_labels: list[str], desired_labels: list[str]) -> dict[str, int]:
+    """Assure les labels, insère les lignes manquantes à la fin du bloc."""
+    existing = [str(x).strip() for x in existing_labels if not _is_blank(x)]
+    r = labels_start_row + len(existing)
+    # r points to first blank row after existing labels
+    to_add = [lab for lab in desired_labels if lab not in existing]
+    if to_add:
+        ws.insert_rows(r, amount=len(to_add))
+        for i, lab in enumerate(to_add):
+            ws.cell(r + i, 2).value = lab
+        existing.extend(to_add)
+    return {lab: labels_start_row + i for i, lab in enumerate(existing)}
+
+def _write_series_to_block(ws, header_row: int, labels_start_row: int, snap: _date, values: pd.Series, desired_order: list[str] | None = None):
+    # read existing labels
+    existing_labels = []
+    r = labels_start_row
+    while True:
+        v = ws.cell(r, 2).value
+        if _is_blank(v):
+            break
+        existing_labels.append(str(v).strip())
+        r += 1
+
+    # decide desired labels
+    if desired_order is None:
+        desired_labels = list(existing_labels)
+        # add any new labels at end
+        for lab in list(values.index):
+            lab_s = str(lab).strip()
+            if lab_s and lab_s not in desired_labels:
+                desired_labels.append(lab_s)
+    else:
+        desired_labels = desired_order.copy()
+        for lab in list(values.index):
+            lab_s = str(lab).strip()
+            if lab_s and lab_s not in desired_labels:
+                desired_labels.append(lab_s)
+
+    mapping = _ensure_labels(ws, labels_start_row, existing_labels, desired_labels)
+    col = _find_or_append_date_col(ws, header_row, snap, start_col=3)
+
+    # write
+    for lab, row in mapping.items():
+        ws.cell(row, col).value = int(values.get(lab, 0))
+
+def plot_stacked_bar(df: pd.DataFrame, title: str, drop_labels: set[str] | None = None):
+    """Stacked bar chart aligned with the displayed KPI tables.
+
+    - Handles empty tables gracefully
+    - Normalizes/sorts date-like columns chronologically
+    - Keeps non-date columns (e.g. a CDC snapshot) at the end
+    """
+    import plotly.graph_objects as go
+
+    if df is None or df.empty:
+        st.info(f"Aucune donnée à tracer pour : {title}")
+        return
+
+    dff = df.copy()
+
+    # Drop rows like 'Total' for charts when requested
+    if drop_labels:
+        dff = dff.drop(index=[x for x in drop_labels if x in dff.index], errors="ignore")
+
+    if dff.empty:
+        st.info(f"Aucune donnée à tracer pour : {title}")
+        return
+
+    # Ensure numeric
+    dff = dff.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+
+    # Normalize columns: parse date-like headers and sort chronologically
+    col_info = []
+    for c in list(dff.columns):
+        dt = pd.to_datetime(c, errors="coerce")
+        if pd.isna(dt):
+            col_info.append((c, None))
+        else:
+            col_info.append((c, dt.date()))
+
+    date_cols = [c for c, d in col_info if d is not None]
+    other_cols = [c for c, d in col_info if d is None]
+
+    # Sort only the date-like columns
+    if date_cols:
+        date_cols_sorted = sorted(date_cols, key=lambda c: pd.to_datetime(c, errors="coerce"))
+        ordered_cols = date_cols_sorted + [c for c in other_cols if c not in date_cols_sorted]
+        dff = dff.loc[:, ordered_cols]
+
+    # X labels
+    x = []
+    for c in dff.columns:
+        dt = pd.to_datetime(c, errors="coerce")
+        if not pd.isna(dt):
+            x.append(dt.strftime("%d/%m/%Y"))
+        else:
+            x.append(str(c))
+
+    fig = go.Figure()
+    for lab in dff.index:
+        fig.add_trace(go.Bar(name=str(lab), x=x, y=dff.loc[lab].tolist()))
+    fig.update_layout(barmode="stack", title=title, height=420, margin=dict(l=10, r=10, t=60, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+# ========================= UI KPI =========================
+
+# ✅ éviter NameError si l'historique n'est pas encore uploadé
+tab1_hist = st.session_state.get("tab1_hist", pd.DataFrame())
+tab2_hist = st.session_state.get("tab2_hist", pd.DataFrame())
+tab3_hist = st.session_state.get("tab3_hist", pd.DataFrame())
+
+st.title("KPI hebdomadaires")
+
+with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
+    cols = st.columns([1.2, 1.2, 1.2])
+    cdc_file = cols[0].file_uploader("1) Uploader le cahier des charges (CDC)", type=["xlsx"], key="cdc_kpi")
+    hist_file = cols[1].file_uploader("2) Uploader l'historique (tableaux_hebdo.xlsx)", type=["xlsx"], key="hist_kpi")
+    snap = cols[2].date_input("3) Date de la semaine", value=_date.today(), key="snap_kpi")
+    fiches_files = st.session_state.get("fiches_uploaded_files", None)  # fiches uploadées en haut
+
+    if hist_file is None:
+        pass
+    else:
+        hist_bytes = hist_file.getvalue()
+        # Workbook pour LECTURE (valeurs) : évite de perdre les valeurs de formules après écriture
+        hist_wb_values = load_workbook(BytesIO(hist_bytes), data_only=True)
+        ws_values = hist_wb_values.active
+
+        # Workbook pour ÉCRITURE (formules conservées) : utilisé uniquement pour générer le fichier à télécharger
+        hist_wb_edit = load_workbook(BytesIO(hist_bytes), data_only=False)
+        ws_edit = hist_wb_edit.active
+
+        # --- Parse CDC (si fourni)
+        cdc_df = None
+        if cdc_file is not None:
+            try:
+                cdc_df = parse_cdc_functions(cdc_file.getvalue())
+            except Exception as e:
+                st.error(str(e))
+
+        t1_current = None
+        t2_current = None
+
+
+        # ===== Tableau 1 & 2 depuis CDC =====
+        if cdc_df is not None and not cdc_df.empty:
+            cdc_df["État_norm"] = cdc_df["État"].astype(str).str.strip()
+            cdc_df["Catégorie_norm"] = cdc_df["Catégorie"].astype(str).str.strip()
+
+            # Tableau 1: En test par BU (Catégorie)
+            en_test = cdc_df[cdc_df["État_norm"].str.lower() == "en test"].copy()
+            cats_order = ["IB","Commun spécifique IB","Commun spécifique PCM","Commun universel","PCM"]
+            t1_current = en_test.groupby("Catégorie_norm")["ID fonctionnalité"].nunique().reindex(cats_order).fillna(0).astype(int)
+
+            # Tableau 2: État des fonctionnalités (comptage par état)
+            t2_current = (
+                cdc_df.groupby("État_norm")["ID fonctionnalité"]
+                .nunique()
+                .astype(int)
+            )
+            # Total = somme des états (si pas déjà présent)
+            if "Total" not in t2_current.index:
+                t2_current.loc["Total"] = int(t2_current.sum())
+
+            # --- Écrire dans l'historique (Tableau 1 & 2) sur le workbook d'édition
+            t1_row = _find_row_by_title(ws_edit, _T1_TITLE) or 3
+            _write_series_to_block(ws_edit, t1_row, t1_row + 1, snap, t1_current, desired_order=cats_order)
+
+            states_order = ["A commencer","A développer","En développement","En test","Disponible","On hold","Total"]
+            _write_series_to_block(ws_edit, 20, 21, snap, t2_current, desired_order=states_order)
+
+        # ===== Tableau 3 depuis les FICHES (PCM / type de doc) =====
+        # 4) Calculer t3_current uniquement à partir des fiches valides
+        # ===== Tableau 3 depuis les FICHES (PCM / type de doc) =====
+        t3_current = pd.Series(dtype=int)
+
+        dfs_kpi = []
+        ignored = []
+
+        if fiches_files:
+            # 1) Protéger l'itération (zip corrompu, flux, etc.)
+            try:
+                excel_files = list(iter_excel_files(fiches_files))
+            except Exception as e:
+                st.error(f"Erreur en lisant les fiches (zip/lecture): {e}")
+                excel_files = []
+
+            # 2) Protéger le parsing fiche par fiche
+            for f in excel_files:
+                name = str(getattr(f, "name", ""))
+
+                # ignore référentiel si présent dans l'upload
+                if name.lower().startswith("pourscript-tableauxjeremie"):
+                    continue
+
+                try:
+                    df = parse_fiche(f)
+                    if df is not None and not df.empty:
+                        dfs_kpi.append(df)
+                except Exception as e:
+                    ignored.append((name or "fichier_sans_nom", str(e)))
+
+            # 3) Afficher les ignorés (optionnel)
+            if ignored:
+                with st.expander(f"⚠️ Fiches ignorées ({len(ignored)})", expanded=False):
+                    for n, err in ignored[:50]:
+                        st.write(f"- {n}: {err}")
+                    if len(ignored) > 50:
+                        st.write(f"... +{len(ignored)-50} autres")
+
+            # 4) Calculer t3_current uniquement à partir des fiches valides
+            if dfs_kpi:
+                data_kpi = pd.concat(dfs_kpi, ignore_index=True)
+                fiches = data_kpi.drop_duplicates(subset="fiche_name").copy()
+
+                fiches_pcm = fiches[fiches["site"].isin(["STMA", "JMT", "FLC"])].copy()
+                fiches_pcm["type_document"] = fiches_pcm["type_document"].astype(str).str.strip()
+                fiches_pcm.loc[fiches_pcm["type_document"].isin(["", "None", "nan"]), "type_document"] = "Inconnu"
+
+                t3_current = (
+                    fiches_pcm.groupby("type_document")["fiche_name"]
+                    .nunique()
+                    .sort_index()
+                    .astype(int)
+                )
+
+        # --- Écrire dans l'historique (Tableau 3)
+        if t3_current is not None and not t3_current.empty:
+            t3_row = _find_row_by_title(ws_edit, _T3_TITLE) or 12
+            _write_series_to_block(ws_edit, t3_row, t3_row+1, snap, t3_current, desired_order=None)
+
+
+
+        # ===== Lire les 3 tableaux depuis l'historique (après écriture) =====
+        # Tableau 1
+        t1_row = _find_row_by_title(ws_values, _T1_TITLE) or 3
+        tab1_hist = _read_block(ws_values, t1_row, t1_row+1)
+
+        # Tableau 2
+        tab2_hist = _read_block(ws_values, 20, 21)
+        # pour le tableau 2 on veut garder Total dans le tableau
+        # (mais on le supprimera sur le graphique)
+        # Assure ordre
+        states_order = ["A commencer","A développer","En développement","En test","Disponible","On hold","Total"]
+        tab2_hist = tab2_hist.reindex([s for s in states_order if s in tab2_hist.index]).fillna(0).astype(int)
+
+        # Tableau 3
+        t3_row = _find_row_by_title(ws_edit, _T3_TITLE) or 12
+        tab3_hist = _read_block(ws_values, t3_row, t3_row+1)
+
+        
+        # ===== Construire les tableaux à AFFICHER : base = tableaux_hebdo (valeurs), + dernière colonne = CDC si fourni
+        tab1_display = tab1_hist.copy()
+        tab2_display = tab2_hist.copy()
+        tab3_display = tab3_hist.copy()
+
+        if t1_current is not None and hasattr(t1_current, "empty") and (not t1_current.empty):
+            col_name = snap.strftime("%Y-%m-%d")
+            tab1_display[col_name] = t1_current.reindex(tab1_display.index).fillna(0).astype(int)
+
+        if t2_current is not None and hasattr(t2_current, "empty") and (not t2_current.empty):
+            col_name = snap.strftime("%Y-%m-%d")
+            # Aligne sur l'index du tableau 2 (qui inclut Total)
+            tab2_display[col_name] = t2_current.reindex(tab2_display.index).fillna(0).astype(int)
+
+        # Tableau 3 : dernière colonne = FICHES (si fournies). C'est le seul tableau dépendant des fiches.
+        if t3_current is not None and hasattr(t3_current, "empty") and (not t3_current.empty):
+            col_name = snap.strftime("%Y-%m-%d")
+            # Conserver exactement la base tableaux_hebdo, mais ajouter/mettre à jour la dernière colonne.
+            # Si de nouveaux types apparaissent, on les ajoute en bas.
+            new_index = tab3_display.index.union(t3_current.index)
+            tab3_display = tab3_display.reindex(new_index).fillna(0)
+            tab3_display[col_name] = t3_current.reindex(tab3_display.index).fillna(0).astype(int)
+
+        # Utiliser les versions enrichies pour l'affichage/graphiques
+        tab1_hist = tab1_display
+        tab2_hist = tab2_display
+        tab3_hist = tab3_display
+
+# ✅ Persistance : conserver les tableaux même lors des reruns Streamlit
+        st.session_state["tab1_hist"] = tab1_display
+        st.session_state["tab2_hist"] = tab2_display
+        st.session_state["tab3_hist"] = tab3_display
+
+        # download updated history
+        out = BytesIO()
+        hist_wb_edit.save(out)
+        st.download_button(
+            "Télécharger l'historique mis à jour (tableaux_hebdo.xlsx)",
+            data=out.getvalue(),
+            file_name="tableaux_hebdo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_hist_kpi"
+        )
+    # ------------------------------------------------------------
+    # Tableaux & graphiques KPI (masquables)
+    # ------------------------------------------------------------
+    if (hist_file is not None) or (not tab1_hist.empty) or (not tab2_hist.empty) or (not tab3_hist.empty):
+        st.markdown("### Tableaux")
+
+        st.markdown("**1) Nombre de fonctionnalités en phase de test par BU**")
+        st.dataframe(tab1_hist, use_container_width=True)
+
+        st.markdown("**2) État des fonctionnalités présentes dans le Cahier des Charges**")
+        st.dataframe(tab2_hist, use_container_width=True)
+
+        st.markdown("**3) Nombre de Fiches de Test remplies PCM par type de document**")
+        st.dataframe(tab3_hist, use_container_width=True)
+
+        # ------------------------------------------------------------
+        # 📌 Graphiques KPI — Toujours visibles et indépendants des fiches
+        # ------------------------------------------------------------
+        st.markdown("### Graphiques")
+
+        plot_stacked_bar(
+            tab1_hist,
+            "1) Nombre de fonctionnalités en phase de test par BU"
+        )
+
+        plot_stacked_bar(
+            tab2_hist,
+            "2) État des fonctionnalités présentes dans le Cahier des Charges",
+            drop_labels={"Total"}
+        )
+
+        plot_stacked_bar(
+            tab3_hist,
+            "3) Nombre de Fiches de Test remplies PCM par type de document"
+        )
+
+
+    else:
+        st.info("Charge `tableaux_hebdo.xlsx` pour afficher les tableaux et graphiques KPI.")
+st.markdown("---")
+
+#Nettoie les cellules des fiches de test
+def _normalize_text(s: object) -> str:
+    """Normalise un texte (minuscule, sans accents, espaces simplifiés)."""
+    if s is None:
+        return ""
+    s= str(s).strip().lower()
+    # Retire les accents
+    s=unicodedata.normalize("NFKD", s)
+    s= "".join(ch for ch in s if not unicodedata.combining(ch))
+    s= re.sub(r"\s+", " ", s)
+    return s
+
+def verdict_to_score(verdict: object) -> float:
+    """Mappe strictement le verdict vers un score : bon=1, partiel=0.5, mauvais=0."""
+    if not isinstance(verdict, str):
+        return np.nan
+    
+    v = verdict.strip() # On garde juste le retrait des espaces inutiles
+    
+    if v == "Bon":
+        return 1.0
+    if v == "Partiellement bon":
+        return 0.5
+    if v == "Mauvais":
+        return 0.0
+        
+    return np.nan # Si c'est vide ou écrit autrement
+
+# ---------------------------------------------------------------------
+def infer_fo_cols(df: pd.DataFrame) -> list[str]:
+    """Détecte automatiquement les colonnes fonctions outils (fo1, fo2, ...), triées numériquement"""
+    cols = []
+    for c in df.columns:
+        cs = str(c).strip()
+        if re.match(r"^fo\d+$", cs):
+            cols.append(cs)
+    def _k(x: str) -> int:
+        m = re.search(r"(\d+)$", x)
+        return int(m.group(1)) if m else 0
+    return sorted(cols, key=_k)
+
+
+def excel_sheet_name(title: str) -> str:
+    """Nom des tableaux-> feuilles pour export excel (même noms que ceux des tableaux affichés sur le streamlit) : 
+    - max 31 caractères
+    - suppression des caractères interdits : : \ / ? * [ ]
+    """
+    if not isinstance(title, str):
+        title = str(title)
+    # Caractères interdits Excel
+    title = re.sub(r"[:\\/\?\*\[\]]", "", title)
+    title = title.strip().strip("'")
+    if not title:
+        title = "Feuil1"
+    return title[:31]
+
+
+# =====================================================================
+# STYLES / COULEURS
+# =====================================================================
+
+#Couleurs pour les verdicts
+def color_verdict(val):
+    if not isinstance(val, str):
+        return ""
+    v = val.strip().lower()
+    if v == "bon":
+        return "background-color: #c6efce; color: #006100; font-weight: bold;"
+    if "partiellement" in v:
+        return "background-color: #ffe699; color: #7f6000; font-weight: bold;"
+    if "mauvais" in v:
+        return "background-color: #fd4a4a; color: #9c0006; font-weight: bold;"
+    return ""
+
+# Regarde dans le tableau avec le nb de tests et performance à atteindre
+def extract_pct(cell):
+    if not isinstance(cell, str):
+        return None
+    cell = cell.strip()
+    if not cell or cell in ("tbd", "NA"):
+        return None
+    if "(" not in cell or "%" not in cell:
+        return None
+    try:
+        inside = cell.split("(")[1].split(")")[0]   # ex: '0.7%' ou '25.0%'
+        inside = inside.replace("%", "").replace(",", ".")
+        return float(inside)
+    except Exception:
+        return None
+
+
+def color_tab3(val):
+    pct = extract_pct(val)
+    if pct is None:
+        return ""
+    # pct est en pourcentage (0–100)
+    if pct < 25:
+        return "background-color: #fd4a4a;"               # rouge
+    elif pct < 50:
+        return "background-color: #f4b183;"               # orange
+    elif pct < 75:
+        return "background-color: #fff2cc;"               # jaune
+    elif pct < 90:
+        return "background-color: #c6efce;"               # vert clair
+    else:
+        return "background-color: #00b050; color: white;" # vert foncé
+
+
+#tableau justesse
+def build_tab2bis(data, ref_base):
+    #seulement les fs réellement testés
+    fs_testes = data["fs_id"].astype(str).str.strip().unique()
+    tab2bis = ref_base[ref_base["N° fs"].isin(fs_testes)].copy()
+
+    #Calcul de la moyenne des scores (0 à 100) avec bon=100%, partiel=50%, mauvais=0%
+    tmp = data.copy()
+    tmp["__score__"] = tmp["verdict_doc"].apply(verdict_to_score) * 100.0
+    taux_fs = (
+        tmp.groupby("fs_id")["__score__"]
+        .mean()
+        .rename(lambda x: str(x).strip())
+        .to_dict()
+    )
+
+    # Remplit les cases avec le % calculé
+    fo_cols = infer_fo_cols(ref_base)
+    def fill_cell(row, fo):
+        val = row[fo]
+        if val != "x":
+            return ""
+        fs = row["N° fs"]
+        actual = taux_fs.get(fs)
+        if actual is None or pd.isna(actual):
+            return ""
+        return f"{actual:.1f}%"
+
+    for fo in fo_cols:
+        tab2bis[fo] = tab2bis.apply(lambda r: fill_cell(r, fo), axis=1)
+
+    return tab2bis, fo_cols
+
+
+def style_tab2bis(df, fo_cols):
+    """Applique les couleurs sur le Tableau Justesse."""
+    styles = _DataFrame("", index=df.index, columns=df.columns)
+
+    for i in df.index:
+        for fo in fo_cols:
+            val = df.at[i, fo]
+            if not isinstance(val, str) or not val:
+                continue
+            if val in ("tbd", "NA"):
+                continue
+            try:
+                pct = float(val.replace("%", "").replace(",", "."))
+            except Exception:
+                continue
+            #en fonction du pourcentage    
+            if pct < 25:
+                styles.at[i, fo] = "background-color: #fd4a4a;"
+            elif pct < 50:
+                styles.at[i, fo] = "background-color: #f4b183;"
+            elif pct < 75:
+                styles.at[i, fo] = "background-color: #fff2cc;"
+            elif pct < 90:
+                styles.at[i, fo] = "background-color: #c6efce;"
+            else:
+                styles.at[i, fo] = "background-color: #00b050; color: white;"
+
+    return styles
+
+
+def norm_verdict(x: str) -> str:
+    """Simplifie le verdict pour les statistiques (compter combien de 'bon', 'mauvais'...)"""
+    if not isinstance(x, str):
+        return "none"
+    x = x.strip().lower()
+    if x in ("", "nan", "none"):
+        return "none"
+    if x == "bon":
+        return "bon"
+    if "partiel" in x:
+        return "partiel"
+    if "mauvais" in x:
+        return "mauvais"
+    return "none"
+
+
+
+def extract_modification(ref):
+    """Extrait le code modification (ex: m01) depuis la référence."""
+    if not isinstance(ref, str):
+        return ""
+    ref = ref.strip()
+    match = re.search(r"(m\d{2})$", ref, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def extract_doc_id(ref: str) -> str:
+    """Extrait un identifiant de document depuis la référence (nom de fichier).
+    Heuristique : cherche d'abord un motif explicite (doc/document/coedm/ref + chiffres),
+    sinon prend la première séquence de >=4 chiffres, sinon retourne la référence entière.
+    """
+    if not isinstance(ref, str):
+        return ""
+    s = ref.strip()
+    m = re.search(r"(?:doc|document|coedm|ref)[-_ ]*(\d+)", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{4,})", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+
+# =====================================================================
+# PARSE FICHE
+# =====================================================================
+
+#permet de lire les cases des fiches de test
+def parse_fiche(file):
+    filename = file.name
+
+    if filename.startswith("~$"):
+        return pd.DataFrame()  # fichier temporaire Excel => on ignore (j'ai déja rencontré le cas, d'où cette sécurité)
+
+    # Exemples de noms :
+    # - fs60-IA-v00-TUF-FFP_PV_...-Fiche-v01-CM.xlsx
+    # - fs1-IA-v00-NR-...-Fiche-v01-CM.xlsx (fs 1 à 3 chiffres)
+    filename_clean = str(filename).strip()
+
+    # --- 1. Analyse du NOM du fichier ---
+    # Vérifie si le nom respecte le format strict fsXX-IA-vXX..
+    pat = r"^(fs\d{1,3})-IA-v\d+-(TUF|NR)-(.+)-Fiche-v\d+-[A-Za-z]+\.xlsx$" # si le nom des fiches change, c'est ici qu'il faut faire les modifs !
+    m = re.match(pat, filename_clean, flags=re.IGNORECASE)
+    if not m:
+        # Si le nom est mauvais, le script s'arrête ici pour ce fichier
+        raise ValueError(
+            "Nom de fichier invalide. Format attendu : "
+            "fs<1-3 chiffres>-IA-vXX-(TUF|NR)-<ref>-Fiche-vXX-<initiales>.xlsx"
+        )
+
+    fs_id = m.group(1).lower()
+    fiche_type = m.group(2).upper()
+    ref_from_filename = m.group(3)
+    doc_id = extract_doc_id(ref_from_filename)
+
+    # après upload des fiches de test, l'outil va lire la feuille "Template Fiche de Test" <- si le nom de la feuille excel change c'est ici qu'il faut modifier 
+    df = pd.read_excel(file, sheet_name="Template Fiche de Test", header=None)
+
+    # -----------------------------------------------------------------
+    # Détection du décalage : ligne 18 contient-elle "*Searchable:" ? (après la nouvelle version du template des fiches de test)
+    # -----------------------------------------------------------------
+    has_searchable_row = False
+    try:
+        row18 = df.iloc[17]  # ligne 18 (index 17)
+        for val in row18:
+            if isinstance(val, str) and "Searchable" in val:
+                has_searchable_row = True
+                break
+    except Exception:
+        pass
+
+    offset = 0 if has_searchable_row else -1
+
+    def r(base_row):
+        # applique le décalage seulement après la ligne 18
+        if base_row > 17:
+            return base_row + offset
+        return base_row
+
+    # ===========================
+    # Champs "avant 18" Récupération des infos générales (En-tête de fiche)
+    # ===========================
+    type_test = df.iloc[4, 1] if pd.notna(df.iloc[4, 1]) else None
+    type_doc = df.iloc[14, 1] if pd.notna(df.iloc[14, 1]) else None
+    ref_coedm = ref_from_filename
+
+    # Label fonctionnalité (ligne 24 → index 23, après 18 → offset)
+    label_fonctionnalite = None
+    try:
+        val_lbl = df.iloc[r(23), 1]
+        if pd.notna(val_lbl):
+            label_fonctionnalite = val_lbl
+    except Exception:
+        pass
+
+    if label_fonctionnalite is None or (
+        isinstance(label_fonctionnalite, float) and pd.isna(label_fonctionnalite)
+    ):
+        label_fonctionnalite = fs_id
+
+    # Date (B10 → ligne 10, index 9) = avant 18
+    date_test = None
+    try:
+        val_date = df.iloc[9, 1]
+        if not pd.isna(val_date):
+            date_test = pd.to_datetime(val_date, errors="coerce")
+    except Exception:
+        pass
+
+    # Site (B9 → ligne 9, index 8, colonne 1)
+    site = None
+    try:
+        val_site = df.iloc[8, 1]  # B9
+        if not pd.isna(val_site):
+            site = str(val_site).strip()
+            if site == "LTA":
+                site = "STMA"
+    except Exception:
+        pass
+
+    # Code modification (B22)
+    code_modif = None
+    try:
+        val_modif = df.iloc[21, 1]  # B22
+        if isinstance(val_modif, str) and val_modif.strip():
+            code_modif = val_modif.strip()
+    except Exception:
+        pass
+    
+
+    # Classe documentaire (D15 → ligne 15, index 14) = avant 18
+    classe_documentaire = None
+    try:
+        val_cls = df.iloc[14, 3]
+        if pd.isna(val_cls):
+            classe_documentaire = None
+        elif isinstance(val_cls, str):
+            v = val_cls.strip()
+            if not v:
+                classe_documentaire = None
+            elif v.lower() == "non":
+                classe_documentaire = "Non Searchable"
+            elif v.lower() == "oui":
+                classe_documentaire = "Searchable"
+            else:
+                classe_documentaire = v
+        else:
+            classe_documentaire = val_cls
+    except Exception:
+        pass
+
+    # Nombre de pages total (ligne 17 → index 16)
+    try:
+        nb_pages_total = int(df.iloc[16, 1])
+    except Exception:
+        nb_pages_total = None
+
+    # Commentaire additionnel (ligne 46 → index 45, après 18 → offset)
+    commentaire_add = None
+    try:
+        comment_row = df.iloc[r(45)]
+        for val in comment_row:
+            if isinstance(val, str) and val.strip():
+                commentaire_add = val.strip()
+                break
+    except Exception:
+        pass
+
+    # Verdict doc : lignes 6 à 12 (index 5..11)
+    verdict_doc = None
+    try:
+        for rr in range(5, 12):
+            val = df.iloc[rr, 2]
+            if isinstance(val, str) and val.strip():
+                verdict_doc = val.strip()
+                break
+    except Exception:
+        pass
+
+    verdict_score = verdict_to_score(verdict_doc)
+
+    # Nom testeur : lignes 6 et 7 (index 5 & 6)
+    nom_testeur = None
+    try:
+        val7 = df.iloc[6, 1]
+        val6 = df.iloc[5, 1]
+        out = []
+        if isinstance(val7, str) and val7.strip():
+            out.append(val7.strip())
+        if isinstance(val6, str) and val6.strip():
+            out.append(val6.strip())
+        if out:
+            nom_testeur = " ".join(out)
+    except Exception:
+        pass
+
+    # Fonctionnalité : 25A / 26A avec offset
+    fonctionnalite = None
+    try:
+        cell_26A = df.iloc[r(25), 0]  # ligne 26 (index 25)
+        cell_25A = df.iloc[r(24), 0]  # ligne 25 (index 24)
+        sentinel = "[NR] Nombre de test de répétabilité requis"
+
+        if isinstance(cell_26A, str) and cell_26A.strip() and cell_26A.strip() != sentinel:
+            fonctionnalite = cell_26A.strip()
+        elif isinstance(cell_25A, str) and cell_25A.strip():
+            fonctionnalite = cell_25A.strip()
+    except Exception:
+        pass
+
+    # Noms des tests (ligne 31 → index 30, après 18 → offset)
+    try:
+        tests = list(df.iloc[r(30), 2:6].dropna())
+    except Exception:
+        tests = []
+
+    records = []
+    # Pour chaque test trouvé...
+    for k in range(len(tests)):
+        col = 2 + k # Décalage de colonnes (C=2, D=3...)
+
+        # lignes 32..37 → index 31..36 → après 18 → offset
+        # On récupère les lignes de résultats (Temps, FN, FP...)
+        row_h = r(31)
+        row_m = r(32)
+        row_j = r(33)
+        row_fn = r(34)
+        row_fp = r(35)
+        row_inc = r(36)
+
+        raw_vals = [
+            df.iloc[row_h, col],   # humain
+            df.iloc[row_m, col],   # machine
+            df.iloc[row_j, col],   # justes
+            df.iloc[row_fn, col],  # fn
+            df.iloc[row_fp, col],  # fp
+            df.iloc[row_inc, col], # incertaines
+        ]
+
+        # Test totalement vide → ignoré
+        if all(pd.isna(v) for v in raw_vals):
+            continue
+
+        def to_float_or_none(v):
+            try:
+                return float(v) if not pd.isna(v) else None
+            except Exception:
+                return None
+
+        humain = to_float_or_none(raw_vals[0])
+        machine = to_float_or_none(raw_vals[1])
+        justes = to_float_or_none(raw_vals[2])
+        fn = to_float_or_none(raw_vals[3])
+        fp = to_float_or_none(raw_vals[4])
+        inc = to_float_or_none(raw_vals[5])
+
+        # Création de l'objet résultat
+        rec = {
+            "fs_id": fs_id,
+            "ref_coedm": ref_coedm,
+            "doc_id": doc_id,
+            "fiche_type": fiche_type,
+            "fiche_name": filename,
+            "date_test": date_test,
+            "type_test": type_test,
+            "type_document": type_doc,
+            "classe_documentaire": classe_documentaire,
+            "site": site,
+            "label_fonctionnalite": label_fonctionnalite,
+            "code_modif": code_modif,
+            "nb_pages_total": nb_pages_total,
+            "commentaire_additionnel": commentaire_add,
+            "verdict_doc": verdict_doc,
+            "verdict_score": verdict_score,
+            "nom_testeur": nom_testeur,
+            "fonctionnalite": fonctionnalite,
+            "test_label": f"Test {k+1}",
+            "temps_humain_s": humain,
+            "temps_machine_s": machine,
+            "nb_pages_justes": justes,
+            "fn": fn,
+            "fp": fp,
+            "incertaines": inc,
+        }
+        # Calcul des pourcentages
+        if nb_pages_total and nb_pages_total != 0:
+            rec["taux_justes"] = (justes / nb_pages_total * 100) if justes is not None else None
+            rec["taux_fn"] = (fn / nb_pages_total * 100) if fn is not None else None
+            rec["taux_fp"] = (fp / nb_pages_total * 100) if fp is not None else None
+            rec["taux_incertaines"] = (inc / nb_pages_total * 100) if inc is not None else None
+        else:
+            rec["taux_justes"] = None
+            rec["taux_fn"] = None
+            rec["taux_fp"] = None
+            rec["taux_incertaines"] = None
+
+
+        if humain is not None and machine is not None:
+            rec["gain_temps_s"] = humain - machine
+        else:
+            rec["gain_temps_s"] = None
+
+        records.append(rec)
+
+    return pd.DataFrame(records)
+
+
+# =====================================================================
+# INTERFACE STREAMLIT
+# =====================================================================
+
+st.title("Analyse automatique des fiches IA4Doc")
+
+# Zone de glisser-déposer des fichiers
+uploaded_files = st.session_state.get("fiches_uploaded_files", None)  # utilise l’uploader du haut
+
 
 if uploaded_files:
 
-    # ------------------------------------------------------
-    # Helpers UI : messages non-rouges (croix)
-    # ------------------------------------------------------
-    def x_error(msg: str):
-        # Remplace st.error (rouge) par un message "croix"
-        st.markdown(f"❌ {msg}")
+    # --- Chargement et Analyse des données ---
+    # On stocke les erreurs dans la session pour pouvoir les supprimer (bouton ❌)
+    if "file_errors" not in st.session_state:
+        st.session_state["file_errors"] = {}
+
+    # Fichiers à ignorer (pour masquer une erreur sans re-uploader)
+    if "ignored_fiche_filenames" not in st.session_state:
+        st.session_state["ignored_fiche_filenames"] = set()
+
+    @st.cache_data(show_spinner=False)
+    def _parse_fiche_cached(fname: str, file_bytes: bytes):
+        """Parse une fiche en cache pour éviter de tout retraiter à chaque rerun."""
+        bio = BytesIO(file_bytes)
+        # pd.read_excel accepte un file-like; on garde le nom pour la validation du pattern
+        try:
+            bio.name = fname  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return parse_fiche(bio)
+
+
+    def add_file_error(fname: str, msg: str):
+        # Garde la dernière erreur pour ce fichier (simple)
+        st.session_state["file_errors"][fname] = msg
 
     # ------------------------------------------------------
     # PARSE DES FICHES + anti-doublon
@@ -562,69 +1481,170 @@ if uploaded_files:
     dfs = []
     seen_files = set()
 
-    for file in iter_excel_files(uploaded_files):
+    try:
+        excel_files = list(iter_excel_files(uploaded_files))
+    except Exception as e:
+        st.error(f"Erreur ZIP/lecture: {e}")
+        excel_files = []
+
+    for file in excel_files:
+
+        # Anti-doublon de fichier
         if file.name in seen_files:
-            x_error(f"Fiche déjà chargée : {file.name} (ignorée)")
+            add_file_error(file.name, f"Fiche déjà chargée : {file.name} (ignorée)")
             continue
         seen_files.add(file.name)
 
+        # Le fichier référentiel (pourScript-tableauxJeremie.xlsx) n'est pas une fiche de test
+        if file.name.lower().startswith("pourscript-tableauxjeremie"):
+            continue
+
+        # Si l'utilisateur a "supprimé" l'erreur (❌), on ignore complètement ce fichier
+        if file.name in st.session_state["ignored_fiche_filenames"]:
+            continue
+
+
         try:
-            df = parse_fiche(file)
+            # APPEL AU LECTEUR (parse_fiche) - version cache pour accélérer les reruns
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+            try:
+                file_bytes = file.getvalue()  # UploadedFile
+            except Exception:
+                file_bytes = file.read()
+            df = _parse_fiche_cached(file.name, file_bytes)
             if not df.empty:
                 dfs.append(df)
         except Exception as e:
-            x_error(f"{file.name} : {e}")
+            add_file_error(file.name, str(e))
+
+    # Affiche les erreurs et permet de les enlever (juste l'affichage, pas besoin de re-uploader)
+    if st.session_state["file_errors"]:
+        st.subheader("Erreurs détectées")
+        for fname, msg in list(st.session_state["file_errors"].items()):
+            c1, c2 = st.columns([12, 1])
+            c1.error(f"{fname} : {msg}")
+            if c2.button("❌", key=f"rm_err_{fname}"):
+                st.session_state["ignored_fiche_filenames"].add(fname)
+                del st.session_state["file_errors"][fname]
+                st.rerun()
 
     if not dfs:
-        st.warning("Aucune fiche valide.")
-        st.stop()
+        st.warning("Aucune fiche valide (les fiches en erreur ont été ignorées).")
+        st.session_state["data_fiches"] = None
+        # IMPORTANT: ne pas stopper l'app -> sinon Tableau/Graph 2 disparaissent
+    else:
+        data = pd.concat(dfs, ignore_index=True)
 
-    data = pd.concat(dfs, ignore_index=True)
+        # ID simple pour pouvoir exclure des lignes plus tard (1 ligne = 1 test)
+        data = data.reset_index(drop=True)
+        data["test_uid"] = data.index.astype(int)
 
-    # ------------------------------------------------------
-    # NR écrase TUF (même doc_id + même fs_id)
-    # ------------------------------------------------------
-    overrides_report = pd.DataFrame()
-    if all(c in data.columns for c in ["doc_id", "fs_id", "fiche_type"]):
-        keep = np.ones(len(data), dtype=bool)
-        rows = []
+        # ✅ stocker APRÈS ajout de test_uid
+        st.session_state["data_fiches"] = data
+
+    
+    data = st.session_state.get("data_fiches")
+
+    # Si aucune fiche valide, on affiche juste les erreurs et on n'exécute pas la suite,
+    # mais on ne plante pas => les KPI (Tableau/Graph 2) restent affichés.
+    if data is None or data.empty:
+        st.info("Analyse fiches : aucune fiche valide à traiter (les autres ont été ignorées).")
+    else:
+        # ------------------------------------------------------
+        # NR / TUF : règle métier
+        # ------------------------------------------------------
+        # - Pour la PERF : si NR existe -> NR gagne ; si plusieurs NR -> on garde la plus récente
+        # - Si pas de NR : on garde la plus récente des TUF
+        # - IMPORTANT : on ne jette rien côté volume. Tous les tests restent dans "data".
+        #
+        # Donc ici on fabrique juste un sous-jeu "data_calc" utilisé pour les moyennes de score.
+        overrides_report = pd.DataFrame()
+        data["date_test"] = pd.to_datetime(data.get("date_test"), errors="coerce")
+
+    def _pick_latest_fiche(g: pd.DataFrame, fiche_type: str):
+        # Renvoie le nom de fiche la plus récente pour un type donné (NR ou TUF)
+        sub = g[g["fiche_type"].astype(str).str.upper() == fiche_type].copy()
+        if sub.empty:
+            return None
+        # Une fiche = plusieurs lignes (Test 1, Test 2...), donc on déduplique au niveau fichier
+        sub = sub.sort_values("date_test", ascending=False)
+        return sub["fiche_name"].iloc[0]
+
+    def _pick_best_fiche(g: pd.DataFrame) -> str:
+        # D'abord NR (le plus récent), sinon TUF (le plus récent), sinon le plus récent tout court
+        fnr = _pick_latest_fiche(g, "NR")
+        if fnr:
+            return fnr
+        ftuf = _pick_latest_fiche(g, "TUF")
+        if ftuf:
+            return ftuf
+        g = g.sort_values("date_test", ascending=False)
+        return g["fiche_name"].iloc[0]
+
+    rows = []
+    best_fiches = []
+
+    if all(c in data.columns for c in ["doc_id", "fs_id", "fiche_type", "fiche_name"]):
         for (doc, fs), g in data.groupby(["doc_id", "fs_id"], dropna=False):
-            types = set(str(x).upper() for x in g["fiche_type"].dropna().unique())
-            if "NR" in types and "TUF" in types:
-                idx_tuf = g[g["fiche_type"].str.upper() == "TUF"].index
-                keep[idx_tuf] = False
-                tuf_perf = pd.to_numeric(g.loc[idx_tuf, "verdict_score"], errors="coerce").mean() * 100
-                nr_perf = pd.to_numeric(g[g["fiche_type"].str.upper() == "NR"]["verdict_score"], errors="coerce").mean() * 100
-                tuf_verdict = g.loc[idx_tuf, "verdict_doc"].dropna().astype(str)
-                tuf_verdict = tuf_verdict.mode().iloc[0] if len(tuf_verdict) else ""
-                nr_verdict_s = g[g["fiche_type"].str.upper() == "NR"]["verdict_doc"].dropna().astype(str)
-                nr_verdict = nr_verdict_s.mode().iloc[0] if len(nr_verdict_s) else ""
+            best = _pick_best_fiche(g)
+            best_fiches.append(best)
+
+            # Petit rapport NR vs TUF (utile en audit)
+            fnr = _pick_latest_fiche(g, "NR")
+            ftuf = _pick_latest_fiche(g, "TUF")
+            if fnr and ftuf:
+                # score = verdict_score (déjà entre 0 et 1)
+                nr_score = pd.to_numeric(g[g["fiche_name"] == fnr]["verdict_score"], errors="coerce").mean()
+                tuf_score = pd.to_numeric(g[g["fiche_name"] == ftuf]["verdict_score"], errors="coerce").mean()
+
+                nr_verdict = g[g["fiche_name"] == fnr]["verdict_doc"].dropna().astype(str)
+                tuf_verdict = g[g["fiche_name"] == ftuf]["verdict_doc"].dropna().astype(str)
+
                 rows.append({
                     "doc_id": doc,
                     "fs_id": fs,
-                    "perf_TUF": tuf_perf,
-                    "perf_NR": nr_perf,
-                    "delta_NR_minus_TUF": (nr_perf - tuf_perf) if pd.notna(nr_perf) and pd.notna(tuf_perf) else np.nan,
-                    "verdict_TUF": tuf_verdict,
-                    "verdict_NR": nr_verdict,
+                    "fiche_NR": fnr,
+                    "fiche_TUF": ftuf,
+                    "verdict_NR": nr_verdict.mode().iloc[0] if len(nr_verdict) else "",
+                    "verdict_TUF": tuf_verdict.mode().iloc[0] if len(tuf_verdict) else "",
+                    "perf_NR": (nr_score * 100) if pd.notna(nr_score) else np.nan,
+                    "perf_TUF": (tuf_score * 100) if pd.notna(tuf_score) else np.nan,
+                    "delta_NR_minus_TUF": ((nr_score - tuf_score) * 100) if pd.notna(nr_score) and pd.notna(tuf_score) else np.nan,
                 })
+
         if rows:
             overrides_report = pd.DataFrame(rows)
-            data = data.loc[keep].copy()
+
+        # data_calc = uniquement les fiches "retenues" pour les calculs de perf
+        data_calc = data[data["fiche_name"].isin(best_fiches)].copy()
+    else:
+        data_calc = data.copy()
 
     data["fs_id"] = data["fs_id"].astype(str).str.strip()
 
-    # UID stable pour pouvoir exclure des tests (❌)
-    data["test_uid"] = data.index.astype(int)
 
     # ------------------------------------------------------
     # Gestion des exclusions (tests à ignorer)
     # ------------------------------------------------------
+
+    # --- Gestion des exclusions manuelles (Cocher pour ignorer) ---
     if "excluded_test_uids" not in st.session_state:
         st.session_state["excluded_test_uids"] = set()
 
+    # ✅ Sécurité : test_uid doit exister quoi qu'il arrive
+    if "test_uid" not in data.columns:
+        data = data.reset_index(drop=True)
+        data["test_uid"] = data.index.astype(int)
+        st.session_state["data_fiches"] = data
     excluded = st.session_state["excluded_test_uids"]
     data_f = data[~data["test_uid"].isin(excluded)].copy()
+
+    # Même logique de filtre mais pour les calculs de perf (NR plus récent, etc.)
+    # On applique aussi les exclusions manuelles.
+    data_calc_f = data_calc[~data_calc["test_uid"].isin(excluded)].copy()
 
     # Colonnes "données extraites" (utilisées aussi pour les exports)
     clean_cols_internal = [
@@ -641,6 +1661,7 @@ if uploaded_files:
         "classe_documentaire",
         "site",
         "fonctionnalite",
+        "code_modif",
         "nb_pages_total",
         "test_label",
         "temps_humain_s",
@@ -657,18 +1678,18 @@ if uploaded_files:
         "verdict_doc",
     ]
 
-    # NB: "test_uid" et "doc_id" sont conservés en interne (exclusions / NR vs TUF)
-    # mais retirés de l’affichage "Données extraites" et des exports.
     clean_cols = [c for c in clean_cols_internal if c not in ("test_uid", "doc_id")]
 
     # ==================================================================
     # CHARGEMENT RÉFÉRENTIEL (Feuil1 / Feuil2)
     # ==================================================================
-    ref_xls = pd.ExcelFile("pourScript-tableauxJeremie.xlsx")
 
+    # C'est là qu'on utilise "infer_fo_cols" pour trouver les colonnes fo1...
+    ref_xls = pd.ExcelFile("pourScript-tableauxJeremie.xlsx") # tableau excel à fournir pour le référentiel des fonctionnalités outil
     ref1 = ref_xls.parse("Feuil1")
     ref2 = ref_xls.parse("Feuil2")
 
+    # Nettoyage colonnes vides
     ref1 = ref1.loc[:, ~ref1.columns.str.contains("Unnamed")]
     ref2 = ref2.loc[:, ~ref2.columns.str.contains("Unnamed")]
 
@@ -694,21 +1715,33 @@ if uploaded_files:
     # Colonnes FO détectées automatiquement (fo1..foN)
     fo_cols = infer_fo_cols(ref_full)
 
+    # On ajoute fo0 si elle n'existe pas
+    if "fo0" not in fo_cols:
+        ref_full["fo0"] = ""
+        fo_cols = ["fo0"] + fo_cols
+
+
     base_cols = ["N° fs"] + fo_cols + ["complexité"]
     ref_base = ref_full[base_cols].copy()
 
-    def ensure_at_least_one_fo(row: pd.Series) -> pd.Series:
-        if not fo_cols:
-            return row
+    # Assure qu'il y a au moins une colonne cochée 'x' 
+    def ensure_at_least_one_fo(row):
+    # Si aucune FO cochée, on met fo0
         if not any(str(row.get(fo, "")).strip().lower() == "x" for fo in fo_cols):
-            row[fo_cols[0]] = "x"
+            row["fo0"] = "x"
         return row
+
 
     ref_base = ref_base.apply(ensure_at_least_one_fo, axis=1)
 
     # ==================================================================
     # Critères / nb tests : depuis Excel si disponible, sinon fallback
     # ==================================================================
+
+
+    #A revoir
+    # --- Récupération des Critères de Réussite (99% etc) ---
+    # Fonctions helpers pour lire les %, int ou 'tbd'
     def _to_percent_str(v):
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return "tbd"
@@ -755,7 +1788,8 @@ if uploaded_files:
             except Exception:
                 return "tbd"
         return "tbd"
-
+    
+    # Dictionnaire par défaut
     crit = {
         "pc":  {"nb": 764, "critere": "99%", "echelle": "moins de 1% de FN soit 99% de TN"},
         "lc":  {"nb": 764, "critere": "99%", "echelle": "moins de 1% de FN soit 99% de TN"},
@@ -810,7 +1844,7 @@ if uploaded_files:
     # =====================================================================
     # 1) Tableau — Performance & quantité de tests par FS
     # =====================================================================
-    st.subheader("1 — Perf & nb tests par FS")
+    st.subheader("1 —Perf & nb tests par FS")
     show_new = st.toggle("Afficher / masquer (1)", value=True, key="show_section_1")
     if show_new:
         # Quantité de tests : au niveau "test" (une ligne = un test)
@@ -821,7 +1855,7 @@ if uploaded_files:
         )
 
         # Performance : au niveau "fiche" (un fichier = un verdict)
-        perf_base = data_f.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        perf_base = data_calc_f.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
         perf_tab = (
             perf_base.groupby("fs_id")
             .agg(performance_score=("verdict_score", "mean"))
@@ -870,7 +1904,8 @@ if uploaded_files:
         tmp_detail["fs_id"] = tmp_detail["fs_id"].astype(str).str.strip()
         tmp_detail["classe_documentaire"] = tmp_detail.get("classe_documentaire", "").fillna("Inconnu").astype(str)
 
-        tmp_perf_detail = tmp_detail.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        tmp_perf_detail = data_calc_f.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        tmp_perf_detail["classe_documentaire"] = tmp_perf_detail.get("classe_documentaire", "").fillna("Inconnu").astype(str)
         perf_by_class = (
             tmp_perf_detail.groupby(["fs_id", "classe_documentaire"])["verdict_score"]
             .mean()
@@ -941,7 +1976,7 @@ if uploaded_files:
     # =====================================================================
     # 2) KPI globaux
     # =====================================================================
-    st.subheader("2 — KPI globaux")
+    st.subheader("2 —KPI globaux")
 
     # KPIs (sur les données filtrées)
     nb_tests_total = int(len(data_f))
@@ -985,7 +2020,7 @@ if uploaded_files:
 
         st.dataframe(
             disp_show[
-                ["doc_id", "fs_id", "verdict_TUF", "verdict_NR", "perf_TUF", "perf_NR", "delta_NR_minus_TUF"]
+                ["doc_id", "fs_id", "fiche_TUF", "fiche_NR", "verdict_TUF", "verdict_NR", "perf_TUF", "perf_NR", "delta_NR_minus_TUF"]
             ],
             use_container_width=True,
         )
@@ -998,7 +2033,7 @@ if uploaded_files:
     # Graphique : évolution CUMULÉE du nombre total de tests (courbe qui grimpe)
     # (axe X datetime => dates espacées proportionnellement)
     # ---------------------------------------------------------------------
-    st.subheader("4 — Évolution cumulée tests")
+    st.subheader("3 —Évolution cumulée tests")
 
     if "date_test" in data_f.columns:
         import matplotlib.dates as mdates
@@ -1043,10 +2078,10 @@ if uploaded_files:
     else:
         st.info("Aucune colonne 'date_test' détectée : impossible d'afficher l'évolution des tests dans le temps.")
 
-    st.subheader("5 — Justesse moyenne FS")
+    st.subheader("4 —Justesse moyenne FS")
     show_tab2bis = st.toggle("Afficher / masquer", value=True, key="show_2bis")
     if show_tab2bis:
-        tab2bis, fo_cols_2bis = build_tab2bis(data_f, ref_base)
+        tab2bis, fo_cols_2bis = build_tab2bis(data_calc_f, ref_base)
         tab2bis_display = tab2bis[["N° fs"] + fo_cols_2bis]
         styles_2bis = style_tab2bis(tab2bis_display, fo_cols_2bis)
         styler_2bis = tab2bis_display.style.apply(lambda _: styles_2bis, axis=None)
@@ -1055,7 +2090,7 @@ if uploaded_files:
     # =====================================================================
     # 4) Tableau 3 (progression)
     # =====================================================================
-    st.subheader("6 — Progression tests FS")
+    st.subheader("5 —Progression tests FS")
     show_tab3 = st.toggle("Afficher / masquer", value=True, key="show_3")
     if show_tab3:
         fs_testes = data_f["fs_id"].unique()
@@ -1110,7 +2145,7 @@ if uploaded_files:
     # =====================================================================
     # 5) Tableau 1 — Référentiel brut
     # =====================================================================
-    st.subheader("7 — Référentiel brut")
+    st.subheader("6 —Référentiel brut")
     show_tab1 = st.toggle("Afficher / masquer", value=False, key="show_1")
     if show_tab1:
         st.dataframe(ref_base)
@@ -1118,7 +2153,7 @@ if uploaded_files:
     # =====================================================================
     # 6) Tableau 2 — Critères par fonctionnalité (SANS code couleur)
     # =====================================================================
-    st.subheader("8 — Critères de réussite par fonctionnalité")
+    st.subheader("7 —Critères de réussite par fonctionnalité")
     show_tab2 = st.toggle("Afficher / masquer", value=False, key="show_2")
     if show_tab2:
         tab2 = ref_base.copy()
@@ -1148,7 +2183,7 @@ if uploaded_files:
     # =====================================================================
     # 8) Réussite par classe doc et fonctionnalités
     # =====================================================================
-    st.subheader("9 — Réussite par classe documentaire et fonctionnalité")
+    st.subheader("8 —Réussite par classe documentaire et fonctionnalité")
     show_cd = st.toggle("Afficher / masquer réussite par classe doc", value=False)
     if show_cd:
         if "classe_documentaire" in data_f.columns:
@@ -1192,7 +2227,7 @@ if uploaded_files:
     # =====================================================================
     # 9) Taux de justesse par classe doc
     # =====================================================================
-    st.subheader("10 — Justesse par classe doc")
+    st.subheader("9 —Justesse par classe doc")
     show_taux_cd = st.toggle("Afficher / masquer taux par classe doc", value=False)
     if show_taux_cd:
         if "classe_documentaire" in data_f.columns:
@@ -1213,7 +2248,7 @@ if uploaded_files:
     # =====================================================================
     # 10) KPI par fonctionnalité
     # =====================================================================
-    st.subheader("11 — KPI par fonctionnalité")
+    st.subheader("10 —KPI par fonctionnalité")
     show_kpi_fct = st.toggle("Afficher / masquer KPI par fonctionnalité", value=False)
     if show_kpi_fct:
         kpi_fct = (
@@ -1270,7 +2305,7 @@ if uploaded_files:
     # =====================================================================
     # 11) Commentaires additionnels
     # =====================================================================
-    st.subheader("12 — Commentaires additionnels détectés")
+    st.subheader("11 —Commentaires additionnels détectés")
     show_comments = st.toggle("Afficher / masquer commentaires", value=False)
     if show_comments:
         comment_rows = (
@@ -1306,7 +2341,7 @@ if uploaded_files:
     # =====================================================================
     # 12) Données extraites + exclusions (❌)
     # =====================================================================
-    st.subheader("13 — Données extraites")
+    st.subheader("12 —Données extraites")
     show_data = st.toggle("Afficher / masquer données extraites", value=False)
     if show_data:
 
@@ -1350,7 +2385,7 @@ if uploaded_files:
         df_clean_f[num_cols_f] = df_clean_f[num_cols_f].round(2)
 
         st.dataframe(df_clean_f.style.applymap(color_verdict, subset=["verdict_doc"]))
-    st.subheader("14 — Résultats par type doc")
+    st.subheader("13 —Résultats par type doc")
     show_type = st.toggle("Afficher / masquer résultats par type de doc", value=False)
     if show_type:
         summary = (
@@ -1370,7 +2405,7 @@ if uploaded_files:
     # =====================================================================
     # 14) Exports
     # =====================================================================
-    st.subheader("15 — Export")
+    st.subheader("14 —Export")
     # 2) Export suivi recettage (Excel) — filtré
     recettage_df = data_f[
         ["fs_id", "verdict_doc", "classe_documentaire", "site", "ref_coedm"]
@@ -1397,7 +2432,7 @@ if uploaded_files:
 
     # 3) Excel multi-feuilles avec un peu de mise en forme
     # --- Reconstruire Tableau 2bis / Tableau 3 (filtré) ---
-    tab2bis_raw, fo_cols_2bis = build_tab2bis(data_f, ref_base)
+    tab2bis_raw, fo_cols_2bis = build_tab2bis(data_calc_f, ref_base)
     tab2bis_xlsx = tab2bis_raw[["N° fs"] + fo_cols_2bis]
 
     fs_testes = data_f["fs_id"].unique()
@@ -1494,14 +2529,14 @@ if uploaded_files:
     output = BytesIO()
 
     # Titres (doivent être identiques aux sous-titres Streamlit et compatibles Excel)
-    TITLE_PERF_FS = "1 — Perf & nb tests par FS"
-    TITLE_JUSTESSE_FS = "5 — Justesse moyenne FS"
-    TITLE_PROG_FS = "6 — Progression tests FS"
+    TITLE_PERF_FS = "1 —Perf & nb tests par FS"
+    TITLE_JUSTESSE_FS = "4 —Justesse moyenne FS"
+    TITLE_PROG_FS = "5 —Progression tests FS"
     TITLE_REPL = "Remplacements NR vs TUF"
-    TITLE_JUSTESSE_CD = "10 — Justesse par classe doc"
-    TITLE_KPI_FCT = "11 — KPI par fonctionnalité"
-    TITLE_DATA = "13 — Données extraites"
-    TITLE_TYPE_DOC = "14 — Résultats par type doc"
+    TITLE_JUSTESSE_CD = "9 —Justesse par classe doc"
+    TITLE_KPI_FCT = "10 —KPI par fonctionnalité"
+    TITLE_DATA = "12 —Données extraites"
+    TITLE_TYPE_DOC = "13 —Résultats par type doc"
 
     # 1) Perf / quantité par FS (filtré)
     perf_fs_export = (
