@@ -438,7 +438,7 @@ def parse_cdc_functions(cdc_bytes: bytes) -> pd.DataFrame:
     ws = wb["1-Fonctionnalités"]
 
     rows = []
-    for r in range(4, ws.max_row + 1):
+    for r in range(5, ws.max_row + 1):
         func_id = ws[f"B{r}"].value
         if _is_blank(func_id):
             continue
@@ -526,6 +526,7 @@ def parse_cdc_functions(cdc_bytes: bytes) -> pd.DataFrame:
 # --- Historique tableaux_hebdo.xlsx (template)
 _T1_TITLE = "Nombre de fonctionnalités en test"
 _T3_TITLE = "Nombre de Fiche de Test remplies"
+_T2_TITLE = "Etat des fonctionnalités"
 
 # dans votre template:
 # - Tableau 1 : titre en B3, dates en C3.., labels en B4..B8
@@ -539,6 +540,73 @@ def _find_row_by_title(ws, title: str) -> int | None:
             return r
     return None
 
+
+def _strip_accents(s: str) -> str:
+    return ''.join(ch for ch in unicodedata.normalize('NFD', s) if unicodedata.category(ch) != 'Mn')
+
+def _find_row_by_title_fuzzy(ws, title: str) -> int | None:
+    """Find row where column B matches title (accent/case-insensitive)."""
+    target = _strip_accents(title).strip().lower()
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 2).value
+        if isinstance(v, str):
+            vv = _strip_accents(v).strip().lower()
+            if vv == target:
+                return r
+    return None
+
+def _detect_table_block_height(ws, labels_start_row: int) -> int:
+    """Detect number of label rows until blank (includes 'Total' row if present)."""
+    r = labels_start_row
+    seen = 0
+    while r <= ws.max_row + 50:
+        v = ws.cell(r, 2).value
+        if _is_blank(v):
+            break
+        seen += 1
+        if isinstance(v, str) and _strip_accents(v).strip().lower() == 'total':
+            break
+        r += 1
+    return seen
+
+def _move_values(ws, src_row: int, dst_row: int, n_rows: int, n_cols: int) -> None:
+    """Move (cut/paste) values in a rectangular range."""
+    if n_rows <= 0 or n_cols <= 0 or src_row == dst_row:
+        return
+    tmp = []
+    for r_off in range(n_rows):
+        row_vals = []
+        for c in range(1, n_cols + 1):
+            row_vals.append(ws.cell(src_row + r_off, c).value)
+        tmp.append(row_vals)
+    # clear src
+    for r_off in range(n_rows):
+        for c in range(1, n_cols + 1):
+            ws.cell(src_row + r_off, c).value = None
+    # paste
+    for r_off in range(n_rows):
+        for c in range(1, n_cols + 1):
+            ws.cell(dst_row + r_off, c).value = tmp[r_off][c-1]
+
+def _normalize_table2_location(ws) -> tuple[int, int]:
+    """Ensure Tableau 2 is anchored at row 20 (title in B20). Returns (title_row, labels_start_row)."""
+    TARGET_ROW = 20
+    found_row = _find_row_by_title_fuzzy(ws, _T2_TITLE)
+    title_row = found_row or TARGET_ROW
+    labels_start = title_row + 1
+    # If table exists elsewhere and B20 is blank, move it to row 20 to keep a single source of truth.
+    if found_row and found_row != TARGET_ROW and _is_blank(ws.cell(TARGET_ROW, 2).value):
+        height = _detect_table_block_height(ws, found_row + 1)
+        dates = _read_date_headers(ws, found_row, start_col=3)
+        n_rows = 1 + height
+        n_cols = 2 + max(1, len(dates))
+        _move_values(ws, found_row, TARGET_ROW, n_rows, n_cols)
+        title_row = TARGET_ROW
+        labels_start = TARGET_ROW + 1
+    # Ensure title exists at anchor
+    if _is_blank(ws.cell(TARGET_ROW, 2).value):
+        ws.cell(TARGET_ROW, 2).value = _T2_TITLE
+    return TARGET_ROW, TARGET_ROW + 1
 def _read_date_headers(ws, row: int, start_col: int = 3) -> list[_date]:
     out = []
     c = start_col
@@ -603,16 +671,37 @@ def _read_block(ws, title_row: int, labels_start_row: int, stop_on_blank: bool =
     return df
 
 def _ensure_labels(ws, labels_start_row: int, existing_labels: list[str], desired_labels: list[str]) -> dict[str, int]:
-    """Assure les labels, insère les lignes manquantes à la fin du bloc."""
+    """Assure les labels dans la colonne B.
+
+    - Conserve l'ordre existant pour les labels déjà présents.
+    - Ajoute les labels manquants.
+    - Si 'Total' existe dans le bloc, insère les nouveaux labels JUSTE AVANT 'Total'
+      (afin de garder 'Total' en dernier).
+    """
     existing = [str(x).strip() for x in existing_labels if not _is_blank(x)]
-    r = labels_start_row + len(existing)
-    # r points to first blank row after existing labels
     to_add = [lab for lab in desired_labels if lab not in existing]
+
     if to_add:
-        ws.insert_rows(r, amount=len(to_add))
-        for i, lab in enumerate(to_add):
-            ws.cell(r + i, 2).value = lab
-        existing.extend(to_add)
+        # Position d'insertion : avant 'Total' si présent, sinon à la fin du bloc
+        total_pos = None
+        for i, v in enumerate(existing):
+            if v.lower() == "total":
+                total_pos = i
+                break
+
+        if total_pos is None:
+            insert_at = labels_start_row + len(existing)
+            ws.insert_rows(insert_at, amount=len(to_add))
+            for i, lab in enumerate(to_add):
+                ws.cell(insert_at + i, 2).value = lab
+            existing.extend(to_add)
+        else:
+            insert_at = labels_start_row + total_pos
+            ws.insert_rows(insert_at, amount=len(to_add))
+            for i, lab in enumerate(to_add):
+                ws.cell(insert_at + i, 2).value = lab
+            existing = existing[:total_pos] + to_add + existing[total_pos:]
+
     return {lab: labels_start_row + i for i, lab in enumerate(existing)}
 
 def _write_series_to_block(ws, header_row: int, labels_start_row: int, snap: _date, values: pd.Series, desired_order: list[str] | None = None):
@@ -647,6 +736,54 @@ def _write_series_to_block(ws, header_row: int, labels_start_row: int, snap: _da
     # write
     for lab, row in mapping.items():
         ws.cell(row, col).value = int(values.get(lab, 0))
+
+
+
+def _pick_kpi_sheet(wb) -> "openpyxl.worksheet.worksheet.Worksheet":
+    """Choisit la feuille qui contient les tableaux KPI.
+
+    On évite d'utiliser wb.active car l'active peut changer après export/sauvegarde.
+    Critère : présence du titre du tableau 1 (et à défaut tableau 3).
+    """
+    for name in wb.sheetnames:
+        ws = wb[name]
+        try:
+            if _find_row_by_title(ws, _T1_TITLE) is not None:
+                return ws
+        except Exception:
+            pass
+        try:
+            if _find_row_by_title(ws, _T3_TITLE) is not None:
+                return ws
+        except Exception:
+            pass
+    return wb.active
+
+def _build_states_order(existing_labels: list[str], new_labels: list[str]) -> list[str]:
+    """Construit un ordre d'états basé sur l'historique (tableaux_hebdo) + nouveaux états (CDC).
+    Règle: tous les états (existants + nouveaux) conservent l'ordre existant, les nouveaux sont ajoutés
+    juste AVANT 'Total', et 'Total' reste en dernier.
+    """
+    existing = [str(x).strip() for x in existing_labels if not _is_blank(x)]
+    new = [str(x).strip() for x in new_labels if not _is_blank(x)]
+
+    # Détecter Total (peut être absent)
+    has_total = any(x.lower() == "total" for x in existing + new)
+
+    # Base = ordre existant sans Total
+    base = [x for x in existing if x.lower() != "total"]
+
+    # Ajouter les nouveaux labels (sans Total) qui n'existent pas encore
+    for lab in new:
+        if lab.lower() == "total":
+            continue
+        if lab not in base:
+            base.append(lab)
+
+    # Remettre Total en dernier si présent
+    if has_total:
+        base.append("Total")
+    return base
 
 def plot_stacked_bar(df: pd.DataFrame, title: str, drop_labels: set[str] | None = None):
     """Stacked bar chart aligned with the displayed KPI tables.
@@ -723,17 +860,27 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
     snap = cols[2].date_input("3) Date de la semaine", value=_date.today(), key="snap_kpi")
     fiches_files = st.session_state.get("fiches_uploaded_files", None)  # fiches uploadées en haut
 
-    if hist_file is None:
+        # ✅ Persister l'historique pour éviter qu'il "disparaisse" lors des reruns (upload fiches/CDC)
+    if hist_file is not None:
+        st.session_state["hist_bytes"] = hist_file.getvalue()
+        st.session_state["hist_name"] = getattr(hist_file, "name", "tableaux_hebdo.xlsx")
+    hist_bytes = st.session_state.get("hist_bytes")
+
+    if hist_bytes is None:
         pass
     else:
         hist_bytes = hist_file.getvalue()
         # Workbook pour LECTURE (valeurs) : évite de perdre les valeurs de formules après écriture
         hist_wb_values = load_workbook(BytesIO(hist_bytes), data_only=True)
-        ws_values = hist_wb_values.active
+        ws_values = _pick_kpi_sheet(hist_wb_values)
 
         # Workbook pour ÉCRITURE (formules conservées) : utilisé uniquement pour générer le fichier à télécharger
         hist_wb_edit = load_workbook(BytesIO(hist_bytes), data_only=False)
-        ws_edit = hist_wb_edit.active
+        # utiliser la même feuille que pour la lecture si possible
+        try:
+            ws_edit = hist_wb_edit[ws_values.title]
+        except Exception:
+            ws_edit = _pick_kpi_sheet(hist_wb_edit)
 
         # --- Parse CDC (si fourni)
         cdc_df = None
@@ -771,8 +918,13 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
             t1_row = _find_row_by_title(ws_edit, _T1_TITLE) or 3
             _write_series_to_block(ws_edit, t1_row, t1_row + 1, snap, t1_current, desired_order=cats_order)
 
-            states_order = ["A commencer","A développer","En développement","En test","Disponible","On hold","Total"]
-            _write_series_to_block(ws_edit, 20, 21, snap, t2_current, desired_order=states_order)
+            # Ordre des états = ordre existant dans tableaux_hebdo (B20..) + nouveaux états du CDC,
+            # en gardant 'Total' en dernier.
+            t2_row, t2_labels_row = _normalize_table2_location(ws_values)
+            tab2_existing = _read_block(ws_values, t2_row, t2_labels_row)
+            dyn_states_order = _build_states_order(list(tab2_existing.index), list(t2_current.index))
+            t2_row_edit, t2_labels_row_edit = _normalize_table2_location(ws_edit)
+            _write_series_to_block(ws_edit, t2_row_edit, t2_labels_row_edit, snap, t2_current, desired_order=dyn_states_order)
 
         # ===== Tableau 3 depuis les FICHES (PCM / type de doc) =====
         # 4) Calculer t3_current uniquement à partir des fiches valides
@@ -842,12 +994,14 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
         tab1_hist = _read_block(ws_values, t1_row, t1_row+1)
 
         # Tableau 2
-        tab2_hist = _read_block(ws_values, 20, 21)
+        t2_row, t2_labels_row = _normalize_table2_location(ws_values)
+        tab2_hist = _read_block(ws_values, t2_row, t2_labels_row)
         # pour le tableau 2 on veut garder Total dans le tableau
         # (mais on le supprimera sur le graphique)
-        # Assure ordre
-        states_order = ["A commencer","A développer","En développement","En test","Disponible","On hold","Total"]
-        tab2_hist = tab2_hist.reindex([s for s in states_order if s in tab2_hist.index]).fillna(0).astype(int)
+        # Assure l'ordre basé sur l'historique (et garde Total en dernier si présent)
+        dyn_states_order = _build_states_order(list(tab2_hist.index), list(tab2_hist.index))
+        tab2_hist = tab2_hist.reindex([s for s in dyn_states_order if s in tab2_hist.index]).fillna(0)
+        tab2_hist = tab2_hist.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
 
         # Tableau 3
         t3_row = _find_row_by_title(ws_edit, _T3_TITLE) or 12
@@ -865,7 +1019,10 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
 
         if t2_current is not None and hasattr(t2_current, "empty") and (not t2_current.empty):
             col_name = snap.strftime("%Y-%m-%d")
-            # Aligne sur l'index du tableau 2 (qui inclut Total)
+            # Étendre l'index avec les nouveaux états du CDC, en gardant 'Total' en dernier
+            dyn_states_order = _build_states_order(list(tab2_display.index), list(t2_current.index))
+            tab2_display = tab2_display.reindex(dyn_states_order).fillna(0).astype(int)
+            # Ajouter la colonne CDC alignée sur le nouvel index (nouveaux états inclus)
             tab2_display[col_name] = t2_current.reindex(tab2_display.index).fillna(0).astype(int)
 
         # Tableau 3 : dernière colonne = FICHES (si fournies). C'est le seul tableau dépendant des fiches.
@@ -893,7 +1050,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
         st.download_button(
             "Télécharger l'historique mis à jour (tableaux_hebdo.xlsx)",
             data=out.getvalue(),
-            file_name="tableaux_hebdo.xlsx",
+            file_name=f"tableaux_hebdo_{snap:%d-%m-%y}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_hist_kpi"
         )
