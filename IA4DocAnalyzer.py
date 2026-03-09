@@ -196,7 +196,7 @@ def parse_fiche(file):
     except Exception:
         pass
 
-    # Verdict doc : lignes 6 à 12 (index 5..11)
+    # Verdict doc : lignes 6 à 12 (case fusionnée index 5..11)
     verdict_doc = None
     try:
         for rr in range(5, 12):
@@ -528,10 +528,6 @@ _T1_TITLE = "Nombre de fonctionnalités en test"
 _T3_TITLE = "Nombre de Fiche de Test remplies"
 _T2_TITLE = "Etat des fonctionnalités"
 
-# dans votre template:
-# - Tableau 1 : titre en B3, dates en C3.., labels en B4..B8
-# - Tableau 3 : titre en B12, dates en C12.., labels en B13.. (types doc)
-# - Tableau 2 : dates en C20.. (B20 vide), labels en B21..B27 dont Total
 
 def _find_row_by_title(ws, title: str) -> int | None:
     for r in range(1, ws.max_row + 1):
@@ -545,7 +541,7 @@ def _strip_accents(s: str) -> str:
     return ''.join(ch for ch in unicodedata.normalize('NFD', s) if unicodedata.category(ch) != 'Mn')
 
 def _find_row_by_title_fuzzy(ws, title: str) -> int | None:
-    """Find row where column B matches title (accent/case-insensitive)."""
+    
     target = _strip_accents(title).strip().lower()
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, 2).value
@@ -556,7 +552,7 @@ def _find_row_by_title_fuzzy(ws, title: str) -> int | None:
     return None
 
 def _detect_table_block_height(ws, labels_start_row: int) -> int:
-    """Detect number of label rows until blank (includes 'Total' row if present)."""
+    
     r = labels_start_row
     seen = 0
     while r <= ws.max_row + 50:
@@ -570,7 +566,7 @@ def _detect_table_block_height(ws, labels_start_row: int) -> int:
     return seen
 
 def _move_values(ws, src_row: int, dst_row: int, n_rows: int, n_cols: int) -> None:
-    """Move (cut/paste) values in a rectangular range."""
+    
     if n_rows <= 0 or n_cols <= 0 or src_row == dst_row:
         return
     tmp = []
@@ -579,24 +575,20 @@ def _move_values(ws, src_row: int, dst_row: int, n_rows: int, n_cols: int) -> No
         for c in range(1, n_cols + 1):
             row_vals.append(ws.cell(src_row + r_off, c).value)
         tmp.append(row_vals)
-    # clear src
+ 
     for r_off in range(n_rows):
         for c in range(1, n_cols + 1):
             ws.cell(src_row + r_off, c).value = None
-    # paste
+  
     for r_off in range(n_rows):
         for c in range(1, n_cols + 1):
             ws.cell(dst_row + r_off, c).value = tmp[r_off][c-1]
 
 def _normalize_table2_location(ws) -> tuple[int, int]:
-    """Locate Tableau 2 dynamically (no fixed row).
-
-    Returns (header_row, labels_start_row). The header row is the row where the title
-    is in column B and the weekly date headers start at column C.
-    """
+   
     found_row = _find_row_by_title_fuzzy(ws, _T2_TITLE) or _find_row_by_title(ws, _T2_TITLE)
     if not found_row:
-        # Fallback to 20 for backward compatibility, but do NOT move anything.
+       
         return 20, 21
     return int(found_row), int(found_row) + 1
 def _read_date_headers(ws, row: int, start_col: int = 3) -> list[_date]:
@@ -1220,18 +1212,19 @@ def build_tab2bis(data, ref_base):
     tab2bis = ref_base[ref_base["N° fs"].isin(fs_testes)].copy()
 
     # -----------------------------------------------------------------
-    # PERFORMANCE (cohérente avec "2 —Perf & nb tests par FS")
+    # PERFORMANCE (cohérente et basée sur les TESTS)
     # Règle métier:
-    # - la performance est calculée au niveau FICHE (un fichier = un verdict)
-    # - "data" est déjà le sous-jeu "retenu" (NR le plus récent sinon TUF le plus récent)
-    # => on déduplique (fs_id, fiche_name) puis on moyenne verdict_score
+    # - un test = une ligne
+    # - la performance = moyenne des verdict_score sur les tests (donc une fiche avec 3 tests 'bon' compte 3)
+    # - "data" est déjà le sous-jeu "tests propres" (NR la plus récente sinon TUF la plus récente)
     # -----------------------------------------------------------------
     tmp = data.copy()
     tmp["fs_id"] = tmp["fs_id"].astype(str).str.strip()
-    tmp["verdict_score"] = pd.to_numeric(tmp.get("verdict_score"), errors="coerce")
-    perf_base = tmp.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+    if "verdict_score" not in tmp.columns:
+        tmp["verdict_score"] = tmp["verdict_doc"].apply(verdict_to_score)
+    tmp["verdict_score"] = pd.to_numeric(tmp["verdict_score"], errors="coerce")
     taux_fs = (
-        perf_base.groupby("fs_id")["verdict_score"]
+        tmp.groupby("fs_id")["verdict_score"]
         .mean()
         .mul(100.0)
         .to_dict()
@@ -2100,10 +2093,15 @@ if uploaded_files:
             .reset_index()
         )
 
-        # Performance : au niveau "fiche" (un fichier = un verdict)
-        perf_base = data_use.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
+        # Performance : basée sur les TESTS (un test = une ligne)
+        perf_src = data_use.copy()
+        perf_src["fs_id"] = perf_src["fs_id"].astype(str).str.strip()
+        if "verdict_score" not in perf_src.columns:
+            perf_src["verdict_score"] = perf_src["verdict_doc"].apply(verdict_to_score)
+        perf_src["verdict_score"] = pd.to_numeric(perf_src["verdict_score"], errors="coerce")
+
         perf_tab = (
-            perf_base.groupby("fs_id")
+            perf_src.groupby("fs_id")
             .agg(performance_score=("verdict_score", "mean"))
             .reset_index()
         )
@@ -2150,8 +2148,12 @@ if uploaded_files:
         tmp_detail["fs_id"] = tmp_detail["fs_id"].astype(str).str.strip()
         tmp_detail["classe_documentaire"] = tmp_detail.get("classe_documentaire", "").fillna("Inconnu").astype(str)
 
-        tmp_perf_detail = data_use.drop_duplicates(subset=["fs_id", "fiche_name"]).copy()
-        tmp_perf_detail["classe_documentaire"] = tmp_perf_detail.get("classe_documentaire", "").fillna("Inconnu").astype(str)
+        # Performance par classe documentaire : basée sur les TESTS (un test = une ligne)
+        tmp_perf_detail = tmp_detail.copy()
+        if "verdict_score" not in tmp_perf_detail.columns:
+            tmp_perf_detail["verdict_score"] = tmp_perf_detail["verdict_doc"].apply(verdict_to_score)
+        tmp_perf_detail["verdict_score"] = pd.to_numeric(tmp_perf_detail["verdict_score"], errors="coerce")
+
         perf_by_class = (
             tmp_perf_detail.groupby(["fs_id", "classe_documentaire"])["verdict_score"]
             .mean()
@@ -2370,51 +2372,41 @@ if uploaded_files:
     show_cd = st.toggle("Afficher / masquer réussite par classe doc", value=False)
     if show_cd:
         if "classe_documentaire" in data_use.columns:
-            # "data_use" = volume total de tests (TUF + NR)
-            # "data_use" = sous-jeu retenu pour la performance (NR le plus récent sinon TUF le plus récent)
-            # Objectif d'affichage : X/X (dont Y écrasées), avec X+Y = nb tests total
+                        # "data_use" = tests propres (NR la plus récente remplace TUF, sinon TUF la plus récente)
+            # Objectif : afficher un ratio X/Y basé sur les TESTS, cohérent avec la performance (%)
+            # utilisée dans "2 — Perf & nb tests par FS" et "4 — Justesse moyenne FS".
+            #
+            # Ici : X = somme des scores de verdict au niveau test (Bon=1, Partiel=0.5, Mauvais=0),
+            #       Y = nombre total de tests (lignes) dans data_use.
 
-            all_cd = data_use.copy()
-            all_cd["fs_id"] = all_cd["fs_id"].astype(str).str.strip()
-            all_cd["classe_documentaire"] = all_cd.get("classe_documentaire", "").fillna("Inconnu").astype(str)
+            cd = data_use.copy()
+            cd["fs_id"] = cd["fs_id"].astype(str).str.strip()
+            cd["classe_documentaire"] = cd.get("classe_documentaire", "").fillna("Inconnu").astype(str)
 
-            eff_cd = data_use.copy()
-            eff_cd["fs_id"] = eff_cd["fs_id"].astype(str).str.strip()
-            eff_cd["classe_documentaire"] = eff_cd.get("classe_documentaire", "").fillna("Inconnu").astype(str)
+            if "verdict_score" in cd.columns:
+                cd["_vs"] = pd.to_numeric(cd["verdict_score"], errors="coerce")
+            else:
+                cd["_vs"] = cd["verdict_doc"].apply(verdict_to_score)
 
-            all_cd["vcat"] = all_cd["verdict_doc"].apply(norm_verdict)
-            eff_cd["vcat"] = eff_cd["verdict_doc"].apply(norm_verdict)
+            cd["_vs"] = pd.to_numeric(cd["_vs"], errors="coerce").fillna(0.0)
 
-            # Totaux (volume)
-            tot_all = all_cd.groupby(["fs_id", "classe_documentaire"]).size().rename("total_tests")
-
-            # "Effectifs" utilisés pour la perf (après règle NR/TUF)
-            tot_eff = eff_cd.groupby(["fs_id", "classe_documentaire"]).size().rename("total_effectif")
-            bon_eff = (
-                eff_cd[eff_cd["vcat"] == "bon"]
-                .groupby(["fs_id", "classe_documentaire"])
-                .size()
-                .rename("bon_effectif")
+            grp = cd.groupby(["fs_id", "classe_documentaire"], dropna=False).agg(
+                total_tests=("test_label", "count"),
+                score_sum=("_vs", "sum"),
             )
 
-            cd_df = pd.concat([tot_all, tot_eff, bon_eff], axis=1).fillna(0)
-            cd_df[["total_tests", "total_effectif", "bon_effectif"]] = cd_df[["total_tests", "total_effectif", "bon_effectif"]].astype(int)
-            cd_df["ecrasees"] = (cd_df["total_tests"] - cd_df["total_effectif"]).clip(lower=0).astype(int)
-
-            def fmt_ratio(row):
-                if row["total_tests"] == 0:
+            def _fmt_ratio(score_sum, total_tests):
+                if total_tests == 0:
                     return ""
-                # dénominateur = effectif (perf), tout en montrant combien ont été écrasées
-                if row["total_effectif"] == 0:
-                    return f"0/0 (dont {int(row['ecrasees'])} écrasées)" if row["ecrasees"] > 0 else "0/0"
-                base = f"{int(row['bon_effectif'])}/{int(row['total_effectif'])}"
-                if row["ecrasees"] > 0:
-                    base += f" (dont {int(row['ecrasees'])} écrasées)"
-                return base
+                # score_sum peut contenir des .5 ; on affiche sans trailing .0
+                s = f"{float(score_sum):g}"
+                return f"{s}/{int(total_tests)}"
 
-            cd_df["ratio"] = cd_df.apply(fmt_ratio, axis=1)
+            grp["ratio"] = [
+                _fmt_ratio(ss, tt) for ss, tt in zip(grp["score_sum"].values, grp["total_tests"].values)
+            ]
 
-            pivot_cd = cd_df.reset_index().pivot(index="fs_id", columns="classe_documentaire", values="ratio")
+            pivot_cd = grp.reset_index().pivot(index="fs_id", columns="classe_documentaire", values="ratio")
             st.dataframe(pivot_cd, use_container_width=True)
         else:
             st.info("Aucune classe documentaire trouvée dans les fiches.")
@@ -2592,7 +2584,7 @@ if uploaded_files:
     show_type = st.toggle("Afficher / masquer résultats par type de doc", value=False)
     if show_type:
         summary = (
-            data_f.groupby("type_document")
+            data_use.groupby("type_document")
             .agg(
                 nb_tests=("test_label", "count"),
                 temps_humain_moy=("temps_humain_s", "mean"),
