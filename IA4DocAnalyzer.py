@@ -523,6 +523,68 @@ def parse_cdc_functions(cdc_bytes: bytes) -> pd.DataFrame:
 
     return pd.DataFrame(out_rows)
 
+
+def parse_cdc_fonctions_disponibles(cdc_bytes: bytes) -> pd.DataFrame:
+    """Construit le tableau 'Fonctions disponibles' à partir du cahier des charges (CDC).
+
+    Règles (données fournies par l'utilisateur) :
+    - Feuille : '1-Fonctionnalités'
+    - Garder uniquement les lignes où :
+        * Colonne A = 1
+        * Colonne AI = 'Disponible' (insensible à la casse)
+    - Pour chaque fonctionnalité (colonne B), regarder les colonnes AK à AR :
+        * présence d'un 'd' (ou 'D') => la fonctionnalité est disponible pour la classe doc correspondante.
+
+    Sortie :
+    - index : 'Fs<id>'
+    - colonnes : 'Classe doc 1' ... 'Classe doc 8'
+    - valeurs : '✓' si disponible, sinon vide.
+    """
+    wb = load_workbook(BytesIO(cdc_bytes), data_only=True)
+    if "1-Fonctionnalités" not in wb.sheetnames:
+        raise ValueError("Feuille '1-Fonctionnalités' introuvable dans le CDC.")
+    ws = wb["1-Fonctionnalités"]
+
+    cd_cols = _excel_col_letters("AK", "AR")  # 8 colonnes => classes doc 1..8
+    out = []
+
+    def _flag_one(v) -> bool:
+        if v is None:
+            return False
+        s = str(v).strip()
+        return s == "1"
+
+    def _is_disponible(v) -> bool:
+        if v is None:
+            return False
+        return str(v).strip().lower() == "disponible"
+
+    for r in range(5, ws.max_row + 1):
+        func_id = ws[f"B{r}"].value
+        if _is_blank(func_id):
+            continue
+
+        if not _flag_one(ws[f"A{r}"].value):
+            continue
+        if not _is_disponible(ws[f"AI{r}"].value):
+            continue
+
+        row = {"FS": f"Fs{str(func_id).strip()}"}
+        for i, col in enumerate(cd_cols, start=1):
+            v = ws[f"{col}{r}"].value
+            # On considère 'd' / 'D' n'importe où dans la cellule (ex: 'd', 'D', 'd - ok', etc.)
+            ok = isinstance(v, str) and ("d" in v.strip().lower())
+            row[f"Classe doc {i}"] = "✓" if ok else ""
+        out.append(row)
+
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+
+    # Index = FS, colonnes = classes doc
+    df = df.set_index("FS")
+    return df
+
 # --- Historique tableaux_hebdo.xlsx (template)
 _T1_TITLE = "Nombre de fonctionnalités en test"
 _T3_TITLE = "Nombre de Fiche de Test remplies"
@@ -851,6 +913,9 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
     snap = cols[2].date_input("3) Date de la semaine", value=_date.today(), key="snap_kpi")
     fiches_files = st.session_state.get("fiches_uploaded_files", None)  # fiches uploadées en haut
 
+    # Tableau CDC : Fonctions disponibles (sera rempli si un CDC est fourni)
+    cdc_dispo_df = None
+
             # ✅ Gérer l'historique : persister les bytes et réagir quand l'utilisateur retire le fichier
     prev_hist_present = st.session_state.get("hist_present", False)
 
@@ -888,7 +953,9 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
         cdc_df = None
         if cdc_file is not None:
             try:
-                cdc_df = parse_cdc_functions(cdc_file.getvalue())
+                cdc_bytes = cdc_file.getvalue()
+                cdc_df = parse_cdc_functions(cdc_bytes)
+                cdc_dispo_df = parse_cdc_fonctions_disponibles(cdc_bytes)
             except Exception as e:
                 st.error(str(e))
 
@@ -1067,6 +1134,12 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
 
         st.markdown("**2) État des fonctionnalités présentes dans le Cahier des Charges**")
         st.dataframe(tab2_hist, use_container_width=True)
+
+        # --- Tableau CDC : Fonctions disponibles (uniquement si un CDC est chargé)
+        if cdc_dispo_df is not None and isinstance(cdc_dispo_df, pd.DataFrame) and (not cdc_dispo_df.empty):
+            st.markdown("**Fonctions disponibles (CDC)**")
+            st.dataframe(cdc_dispo_df, use_container_width=True)
+
 
         st.markdown("**3) Nombre de Fiches de Test remplies PCM par type de document**")
         st.dataframe(tab3_hist, use_container_width=True)
@@ -2217,6 +2290,16 @@ if uploaded_files:
             margin=dict(t=80, b=40, l=40, r=40),
         )
         st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ✅ Export interactif : conserve les infos au survol (hover) dans un fichier HTML
+        fig_html = fig_bar.to_html(include_plotlyjs="cdn", full_html=True)
+        st.download_button(
+            "Exporter le graphique Performance vs Quantité (HTML interactif)",
+            data=fig_html,
+            file_name="graph_perf_vs_quantite.html",
+            mime="text/html",
+            key="dl_graph_perf_vs_quantite_html",
+        )
 
     # =====================================================================
     # 2) KPI globaux
