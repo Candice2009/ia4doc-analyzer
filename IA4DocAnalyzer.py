@@ -569,7 +569,7 @@ def parse_cdc_fonctions_disponibles(cdc_bytes: bytes) -> pd.DataFrame:
         if not _is_disponible(ws[f"AI{r}"].value):
             continue
 
-        row = {"FS": f"Fs{str(func_id).strip()}"}
+        row = {"FS": f"{str(func_id).strip()}"}
         for i, col in enumerate(cd_cols, start=1):
             v = ws[f"{col}{r}"].value
             # On considère 'd' / 'D' n'importe où dans la cellule (ex: 'd', 'D', 'd - ok', etc.)
@@ -958,7 +958,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
                 cdc_dispo_df = parse_cdc_fonctions_disponibles(cdc_bytes)
             except Exception as e:
                 st.error(str(e))
-
+        st.write("DEBUG dispo shape:", None if cdc_dispo_df is None else cdc_dispo_df.shape)
         t1_current = None
         t2_current = None
 
@@ -1129,16 +1129,18 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
     if (hist_file is not None) or (not tab1_hist.empty) or (not tab2_hist.empty) or (not tab3_hist.empty):
         st.markdown("### Tableaux")
 
+        # --- Tableau CDC : Fonctions disponibles (uniquement si un CDC est chargé)
+        if cdc_dispo_df is not None and isinstance(cdc_dispo_df, pd.DataFrame) and (not cdc_dispo_df.empty):
+            st.markdown("**Fonctions disponibles (CDC)**")
+            st.dataframe(cdc_dispo_df, use_container_width=True)
+
         st.markdown("**1) Nombre de fonctionnalités en phase de test par BU**")
         st.dataframe(tab1_hist, use_container_width=True)
 
         st.markdown("**2) État des fonctionnalités présentes dans le Cahier des Charges**")
         st.dataframe(tab2_hist, use_container_width=True)
 
-        # --- Tableau CDC : Fonctions disponibles (uniquement si un CDC est chargé)
-        if cdc_dispo_df is not None and isinstance(cdc_dispo_df, pd.DataFrame) and (not cdc_dispo_df.empty):
-            st.markdown("**Fonctions disponibles (CDC)**")
-            st.dataframe(cdc_dispo_df, use_container_width=True)
+
 
 
         st.markdown("**3) Nombre de Fiches de Test remplies PCM par type de document**")
