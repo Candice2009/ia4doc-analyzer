@@ -557,7 +557,7 @@ def parse_cdc_fonctions_disponibles(cdc_bytes: bytes) -> pd.DataFrame:
     def _is_disponible(v) -> bool:
         if v is None:
             return False
-        return str(v).strip().lower() == "disponible"
+        return str(v).strip().lower().startswith("disponible")
 
     for r in range(5, ws.max_row + 1):
         func_id = ws[f"B{r}"].value
@@ -566,15 +566,22 @@ def parse_cdc_fonctions_disponibles(cdc_bytes: bytes) -> pd.DataFrame:
 
         if not _flag_one(ws[f"A{r}"].value):
             continue
-        if not _is_disponible(ws[f"AI{r}"].value):
+
+        ai_val = ws[f"AI{r}"].value
+        if not _is_disponible(ai_val):
             continue
+
+        ai_str = str(ai_val).strip().lower()
+        if "totalement" in ai_str:
+            symbol = "✓✓"
+        else:
+            symbol = "✓"   # "disponible avec réserve(s)" ou simple "disponible"
 
         row = {"FS": f"{str(func_id).strip()}"}
         for i, col in enumerate(cd_cols, start=1):
             v = ws[f"{col}{r}"].value
-            # On considère 'd' / 'D' n'importe où dans la cellule (ex: 'd', 'D', 'd - ok', etc.)
             ok = isinstance(v, str) and ("d" in v.strip().lower())
-            row[f"Classe doc {i}"] = "✓" if ok else ""
+            row[f"Classe doc {i}"] = symbol if ok else ""
         out.append(row)
 
     df = pd.DataFrame(out)
